@@ -1,0 +1,8 @@
+# Hugging Face streaming plus optional dashboard/notebook packages.
+datasets>=2.19
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+torch>=2.3
+Pillow>=10.4

@@ -1,0 +1,186 @@
+1. Đề: Cá nhân hóa trải nghiệm mua hàng trong thương mại điện tử thông qua cơ chế khai thác dữ liệu đa phương thức.
+
+2. Sơ đồ cơ bản:
+User behavior + Product metadata + Product text + Product image + Context
+        ↓
+Deep Learning Recommendation Model
+        ↓
+Personalized Shopping Experience
+
+3. Kỹ thuật chính: Top-K Personalized Product Recommendation
+4. Dataset:
+Dataset chính: https://amazon-reviews-2023.github.io/
+Dataset giả lập: 2 phương án tạo toàn bộ schema dataset hoặc thêm field dự đoán.
+5. Dataset Schema:
+-  users.csv: user_id, user_segment, activity_level, avg_rating, preferred_categories, 
+preferred_price_range, preferred_brand/store
+-  products.csv: product_id, title, category, store/brand, price, average_rating, rating_number
+description, features, image_url
+-  interactions.csv: user_id, product_id, event_type, event_weight, rating, timestamp, 
+verified_purchase, session_id
+-  reviews.csv: user_id, product_id, review_title, review_text, rating, timestamp, helpful_vote
+-  product_embeddings.csv: product_id, text_embedding, image_embedding, 
+metadata_embedding, fused_embedding
+-  sessions.csv: session_id, user_id, timestamp, session_intent, device, event_sequence
+-  business_context.csv: product_id, inventory_score, margin_score, discount_rate, risk_score,campaign_eligible
+6. Dữ liệu multimodal:
+6.1. Behavior modality:
+Theo Interaction
+user đã rating
+user đã review
+user đã verified_purchase
+user đã click/view/cart giả lập
+Chuyển sang quy đổi (Dự kiến đánh số từ 0 -> 5)
+rating >= 4 → positive interaction
+rating = 3 → weak interaction
+rating <= 2 → negative hoặc bỏ
+verified_purchase = True → tăng weight
+6.2. Text modality
+Từ title, features, description, categories, review text
+Cách tạo product text: product_text = title + features + description + category
+Sau đó encode bằng: Sentence-BERT / MiniLM / BERT hoặc dùng TF-IDF làm baseline.
+6.3. Image modality
+Từ: product image URL sang download image subset -> CLIP / ResNet / ViT -> image embedding
+Dự kiến subset: 5,000 - 20,000 products có ảnh. Nếu khó, có thể dùng image embedding giả lập, nhưng dùng ảnh thật từ Amazon Reviews 2023 sẽ thuyết phục hơn.
+6.4. Metadata modality
+Từ: category, price, brand/store, average_rating, rating_number, details sang encode categorical embedding, normalized numerical features 
+7. Cách sử dụng dữ liệu giả lập (synthetic data)
+Open source sẽ có: user_id, product_id, rating, review, timestamp, product metadata, product image URL
+-> nên giả lập thêm view, click, add_to_cart, session_id, session_intent, user_segment, inventory_score, margin_score, discount_rate, risk_score, campaign_eligible
+-> có thể tạo synthetic data tương tự với open source
+8. Kiến trúc đề xuất:
+Data Layer
+  ├── User behavior
+  ├── Product metadata
+  ├── Product text
+  ├── Product image
+  ├── Review/rating
+  └── Synthetic session/business context
+
+        ↓
+
+Processing Layer
+  ├── cleaning
+  ├── encoding
+  ├── negative sampling
+  ├── train/validation/test split
+  └── embedding extraction
+
+        ↓
+
+Representation Layer
+  ├── user embedding
+  ├── text embedding
+  ├── image embedding
+  ├── metadata embedding
+  └── context embedding
+
+        ↓
+
+Recommendation Layer
+  ├── baseline models
+  ├── Two-Tower model
+  ├── multimodal fusion
+  └── top-K ranking
+
+        ↓
+
+Personalization Layer
+  ├── Recommended for you
+  ├── Because you liked
+  ├── Similar products
+  ├── Bundle suggestion
+  └── Explanation
+
+        ↓
+
+Demo / Evaluation
+  ├── dashboard
+  ├── metrics
+  ├── ablation study
+  └── scenario testing
+9. Model triển khai: Multimodal Two-Tower Recommendation Model 
+9.1. User Tower 
+Input: user_id, user profile, historical interactions, preferred categories, session context
+Output: user_embedding
+9.2. Item Tower 
+Input: product_id, metadata embedding, text embedding, image embedding, price/category, features
+Output: item_embedding 
+9.3. Matching: score(user, item) = dot product hoặc cosine similarity -> Output: recommendation score
+10. Fusion multimodal
+Fusion 1: Concatenation Fusion: fused_item = concat(metadata_embedding, text_embedding, image_embedding)
+Fusion 2: Weighted Fusion: fused_item = α × metadata + β × text + γ × image
+Fusion 3: Attention Fusion: metadata/text/image embedding -> attention layer -> fused representation
+11. Baseline: Popularity-based, Content-based recommendation, Collaborative Filtering / Matrix Factorization, Neural Collaborative Filtering hoặc Two-Tower behavior-only, Multimodal Two-Tower proposed model
+12. Evaluation:
+12.1. Recommendation accuracy
+Metric: Recall@K, Precision@K, NDCG@K, HitRate@K, MRR@K, Recall@10, NDCG@10, HitRate@10
+12.2. Ablation study 
+So sánh: Behavior only, Metadata only, Text only, Image only, Behavior + Text, Behavior + Image, Behavior + Metadata, Behavior + Text + Image + Metadata
+-> Mục tiêu: chứng minh việc kết hợp nhiều modality tốt hơn single modality
+12.3. Personalization quality: Accuracy, Diversity, Novelty, Coverage, Intra-list diversity
+-> Vì trải nghiệm mua hàng cá nhân hóa không chỉ cần đúng, mà còn cần đa dạng, mới mẻ, hữu ích. 
+12.4. Scenario evaluation
+Bao gồm: User mới / ít tương tác, Product mới / ít interaction, User thích giá thấp, User thích style cụ thể, User thay đổi intent trong session, Sản phẩm có text/image phù hợp nhưng ít rating
+Mục tiêu: kiểm tra hệ thống có hành xử đúng logic cá nhân hóa không
+13. Demo
+Dùng Steamlit
+Chức năng MVP:
+Input: customer_id (hoặc chọn user segment hay session intent)
+Output: Top-K personalized products, score, product title/category/price/image nếu có,  explanation, similar products, optional bundle suggestion
+Các module demo: 
+Recommended for You: Top-K sản phẩm cá nhân hóa cho user
+Because You Liked: giải thích dựa trên sản phẩm user từng thích/mua
+Similar Products: tìm sản phẩm tương tự bằng text/image embedding
+Bundle Suggestion: gợi ý combo đơn giản, ví dụ: shirt + trousers, dress + bag, skincare cleanser + moisturizer
+14. Cấu trúc thư mục dự án:
+personalized-shopping-multimodal/
+│
+├── data/
+│   ├── raw/
+│   ├── processed/
+│   └── embeddings/
+│
+├── notebooks/
+│   ├── 01_data_exploration.ipynb
+│   ├── 02_data_preprocessing.ipynb
+│   ├── 03_feature_extraction.ipynb
+│   ├── 04_baselines.ipynb
+│   ├── 05_two_tower_model.ipynb
+│   └── 06_evaluation.ipynb
+│
+├── src/
+│   ├── data/
+│   ├── preprocessing/
+│   ├── feature_extraction/
+│   ├── models/
+│   ├── training/
+│   ├── evaluation/
+│   ├── personalization/
+│   └── app/
+│
+├── outputs/
+│   ├── models/
+│   ├── tables/
+│   ├── figures/
+│   └── reports/
+│
+├── requirements.txt
+└── README.md
+15. Paper/ keyword cần tìm (dùng để phân tích thêm hệ thống)
+recommender systems, deep learning recommender systems, neural collaborative filtering, two tower recommendation, multimodal recommender systems, visual recommendation, text image recommendation, personalized shopping experience, e-commerce recommendation, synthetic data generation recommender systems, semi-synthetic data recommender systems, Amazon Reviews 2023 dataset, LLM-powered agents for recommender systems
+16. MVP tối thiểu cần có
+1. Load và xử lý subset Amazon Reviews 2023
+2. Tạo users/products/interactions
+3. Tạo product text embedding
+4. Tạo image embedding cho subset sản phẩm
+5. Tạo interaction train/val/test
+6. Popularity baseline
+7. Content-based baseline
+8. Multimodal Two-Tower model
+9. Evaluation Recall@10, NDCG@10, HitRate@10
+10. Streamlit demo: user_id → top-K sản phẩm + explanation
+
+
+
+
