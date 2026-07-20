@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from src.preprocessing.dataset_builder import (
+    append_processed_dataset_from_reviews,
     build_products,
     write_processed_dataset_from_reviews,
 )
@@ -39,6 +40,25 @@ class DatasetBuilderTests(unittest.TestCase):
             self.assertTrue((output / "products.csv").exists())
             self.assertTrue((output / "interactions.csv").exists())
             self.assertIn("source_category", (output / "reviews.csv").read_text(encoding="utf-8").splitlines()[0])
+
+    def test_append_preserves_catalog_and_adds_local_fashion_subcategory(self) -> None:
+        fashion_review = dict(
+            sample_review(""),
+            user_id="fashion-user",
+            product_id="shirt-1",
+            review_title="Comfortable cotton shirt",
+            review_text="Soft t-shirt tee for everyday wear",
+            timestamp=1_700_000_000_001,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            write_processed_dataset_from_reviews([sample_review()], directory)
+
+            summary = append_processed_dataset_from_reviews([fashion_review], directory)
+            products = (Path(directory) / "products.csv").read_text(encoding="utf-8")
+
+            self.assertEqual(summary["appended_reviews"], 1)
+            self.assertIn("Automotive", products)
+            self.assertIn("tops", products)
 
 
 if __name__ == "__main__":

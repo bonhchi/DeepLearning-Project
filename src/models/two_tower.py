@@ -21,6 +21,7 @@ class TwoTowerModel:
         self.user_embeddings: dict[str, list[float]] = {}
         self.item_embeddings: dict[str, list[float]] = {}
         self.item_bias: dict[str, float] = {}
+        self.training_config: dict[str, float | int] = {}
 
     # Khởi tạo vector item tower từ đặc trưng đa phương thức đã hợp nhất.
     def _init_item(self, product_id: str, product_embeddings: dict[str, list[float]]) -> None:
@@ -67,6 +68,11 @@ class TwoTowerModel:
         negative_samples: int = 2,
         learning_rate: float = 0.04,
     ) -> "TwoTowerModel":
+        self.training_config = {
+            "epochs": epochs,
+            "negative_samples": negative_samples,
+            "learning_rate": learning_rate,
+        }
         positives = [
             row
             for row in interactions
@@ -138,6 +144,7 @@ class TwoTowerModel:
             "user_embeddings": self.user_embeddings,
             "item_embeddings": self.item_embeddings,
             "item_bias": self.item_bias,
+            "training_config": self.training_config,
         }
 
     # Khôi phục model từ dictionary tương thích JSON.
@@ -147,6 +154,7 @@ class TwoTowerModel:
         model.user_embeddings = {str(key): list(value) for key, value in data.get("user_embeddings", {}).items()}
         model.item_embeddings = {str(key): list(value) for key, value in data.get("item_embeddings", {}).items()}
         model.item_bias = {str(key): float(value) for key, value in data.get("item_bias", {}).items()}
+        model.training_config = dict(data.get("training_config", {}))
         return model
 
     # Lưu model thành artifact JSON.

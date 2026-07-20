@@ -1,7 +1,5 @@
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +7,7 @@ from unittest.mock import patch
 from src.data.amazon_reviews import (
     DEFAULT_CATEGORIES,
     huggingface_review_url,
+    extract_catalog_image_url,
     iter_huggingface_reviews,
     iter_reviews,
     normalize_review,
@@ -53,13 +52,12 @@ class AmazonReviewReaderTests(unittest.TestCase):
     def test_huggingface_reader_streams_and_limits_each_category(self) -> None:
         calls = []
 
-        def fake_load_dataset(*args, **kwargs):
-            calls.append((args, kwargs))
-            return [dict(RAW_REVIEW, user_id=f"user-{index}") for index in range(3)]
+        def fake_remote_jsonl(url):
+            calls.append(url)
+            return iter(dict(RAW_REVIEW, user_id=f"user-{index}") for index in range(3))
 
-        fake_datasets = types.SimpleNamespace(load_dataset=fake_load_dataset)
         categories = ("Automotive", "Electronics")
-        with patch.dict(sys.modules, {"datasets": fake_datasets}):
+        with patch("src.data.amazon_reviews.iter_remote_jsonl", side_effect=fake_remote_jsonl):
             reviews = list(iter_huggingface_reviews(categories, limit_per_category=2))
 
         self.assertEqual(len(reviews), 4)
@@ -70,11 +68,11 @@ class AmazonReviewReaderTests(unittest.TestCase):
             "Electronics",
         ])
         self.assertEqual(len(calls), 2)
-        self.assertTrue(all(call[1]["streaming"] for call in calls))
-        self.assertEqual(calls[0][0][0], "json")
+        self.assertTrue(calls[0].endswith("raw/review_categories/Automotive.jsonl"))
 
     def test_categories_are_explicitly_validated(self) -> None:
         self.assertEqual(validate_categories(DEFAULT_CATEGORIES), DEFAULT_CATEGORIES)
+        self.assertEqual(validate_categories(["Appliances"]), ("Appliances",))
         with self.assertRaises(ValueError):
             validate_categories(["All_Beauty"])
 
@@ -82,6 +80,21 @@ class AmazonReviewReaderTests(unittest.TestCase):
         url = huggingface_review_url("Health_and_Household")
         self.assertIn("McAuley-Lab/Amazon-Reviews-2023", url)
         self.assertTrue(url.endswith("raw/review_categories/Health_and_Household.jsonl"))
+
+    def test_catalog_image_prefers_main_high_resolution(self) -> None:
+        images = [
+            {"variant": "PT01", "hi_res": "detail.jpg", "large": "detail-large.jpg"},
+            {"variant": "MAIN", "hi_res": "main.jpg", "large": "main-large.jpg"},
+        ]
+        self.assertEqual(extract_catalog_image_url(images), "main.jpg")
+
+    def test_catalog_image_supports_huggingface_dict_of_lists(self) -> None:
+        images = {
+            "variant": ["PT01", "MAIN"],
+            "hi_res": ["detail.jpg", None],
+            "large": ["detail-large.jpg", "main-large.jpg"],
+        }
+        self.assertEqual(extract_catalog_image_url(images), "main-large.jpg")
 
 
 if __name__ == "__main__":

@@ -8,8 +8,23 @@ from pathlib import Path
 from typing import Iterable
 
 from src.data.amazon_reviews import iter_reviews
-from src.io_utils import parse_float, parse_int, parse_bool, write_csv_rows
+from src.io_utils import parse_float, parse_int, parse_bool, read_csv_rows, write_csv_rows
 from src.vector_ops import stable_hash_int
+
+
+PRODUCT_FIELDS = [
+    "product_id",
+    "title",
+    "category",
+    "store",
+    "price",
+    "average_rating",
+    "rating_number",
+    "description",
+    "features",
+    "image_url",
+    "preferred_price_range",
+]
 
 
 # Chuyển timestamp mili-giây thành bucket ngày dạng số nguyên.
@@ -365,19 +380,7 @@ def write_processed_dataset_from_reviews(reviews_source: Iterable[dict], output_
     write_csv_rows(
         output / "products.csv",
         products,
-        [
-            "product_id",
-            "title",
-            "category",
-            "store",
-            "price",
-            "average_rating",
-            "rating_number",
-            "description",
-            "features",
-            "image_url",
-            "preferred_price_range",
-        ],
+        PRODUCT_FIELDS,
     )
     write_csv_rows(
         output / "users.csv",
@@ -439,3 +442,110 @@ def write_processed_dataset(
         iter_reviews(raw_path, limit=limit),
         output_dir,
     )
+
+
+def append_processed_dataset_from_reviews(
+    reviews_source: Iterable[dict],
+    output_dir: str | Path,
+) -> dict:
+    """Ghép review mới vào processed catalog mà vẫn giữ metadata và ảnh hiện có."""
+    output = Path(output_dir)
+    products_path = output / "products.csv"
+    interactions_path = output / "interactions.csv"
+    reviews_path = output / "reviews.csv"
+    if not products_path.exists() or not interactions_path.exists() or not reviews_path.exists():
+        return write_processed_dataset_from_reviews(reviews_source, output)
+
+    existing_products = read_csv_rows(products_path)
+    existing_interactions = read_csv_rows(interactions_path)
+    existing_reviews = read_csv_rows(reviews_path)
+    existing_review_keys = {
+        (
+            row.get("user_id", ""),
+            row.get("product_id", ""),
+            parse_int(row.get("timestamp"), 0),
+        )
+        for row in existing_reviews
+    }
+    new_reviews = []
+    duplicates_skipped = 0
+    for review in reviews_source:
+        key = (
+            str(review.get("user_id", "")),
+            str(review.get("product_id", "")),
+            parse_int(review.get("timestamp"), 0),
+        )
+        if key in existing_review_keys:
+            duplicates_skipped += 1
+            continue
+        existing_review_keys.add(key)
+        new_reviews.append(review)
+
+    if not new_reviews:
+        return {
+            "reviews": len(existing_reviews),
+            "products": len(existing_products),
+            "interactions": len(existing_interactions),
+            "appended_reviews": 0,
+            "duplicate_reviews_skipped": duplicates_skipped,
+        }
+
+    interactions = split_interactions([*existing_interactions, *build_interactions(new_reviews)])
+    product_map = {row["product_id"]: row for row in existing_products}
+    for product_row in build_products(new_reviews):
+        # Giữ metadata/ảnh đã enrich nếu ASIN đã tồn tại trong catalog.
+        product_map.setdefault(product_row["product_id"], product_row)
+    products = sorted(product_map.values(), key=lambda row: row["product_id"])
+    users = build_users(interactions, products)
+    sessions = build_sessions(interactions, products)
+    business_context = build_business_context(products)
+    reviews_table = [*existing_reviews, *build_reviews_table(new_reviews)]
+
+    write_csv_rows(
+        interactions_path,
+        interactions,
+        [
+            "user_id", "product_id", "event_type", "event_weight", "rating", "timestamp",
+            "verified_purchase", "session_id", "label", "split", "source_category",
+        ],
+    )
+    write_csv_rows(products_path, products, PRODUCT_FIELDS)
+    write_csv_rows(
+        output / "users.csv",
+        users,
+        [
+            "user_id", "user_segment", "activity_level", "avg_rating",
+            "preferred_categories", "preferred_price_range", "preferred_store",
+        ],
+    )
+    write_csv_rows(
+        reviews_path,
+        reviews_table,
+        [
+            "user_id", "product_id", "review_title", "review_text", "rating", "timestamp",
+            "helpful_vote", "source_category",
+        ],
+    )
+    write_csv_rows(
+        output / "sessions.csv",
+        sessions,
+        ["session_id", "user_id", "timestamp", "session_intent", "device", "event_sequence"],
+    )
+    write_csv_rows(
+        output / "business_context.csv",
+        business_context,
+        [
+            "product_id", "inventory_score", "margin_score", "discount_rate",
+            "risk_score", "campaign_eligible",
+        ],
+    )
+    return {
+        "reviews": len(reviews_table),
+        "users": len(users),
+        "products": len(products),
+        "interactions": len(interactions),
+        "sessions": len(sessions),
+        "business_context_rows": len(business_context),
+        "appended_reviews": len(new_reviews),
+        "duplicate_reviews_skipped": duplicates_skipped,
+    }

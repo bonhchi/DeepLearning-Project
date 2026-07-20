@@ -62,6 +62,11 @@ class ProjectConfig:
     def product_embeddings_jsonl_path(self) -> Path:
         return self.embeddings_dir / "product_embeddings.jsonl"
 
+    # Trả về vocabulary TF-IDF dùng để hiểu nhu cầu nhập vào.
+    @property
+    def text_vocabulary_path(self) -> Path:
+        return self.embeddings_dir / "text_vocabulary.json"
+
     # Trả về đường dẫn artifact model two-tower đã train.
     @property
     def two_tower_model_path(self) -> Path:

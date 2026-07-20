@@ -5,22 +5,22 @@
     "hit_rate@5": 0.0,
     "ndcg@5": 0.0,
     "mrr@5": 0.0,
-    "users_evaluated": 76
+    "users_evaluated": 213
   },
   "content_based": {
-    "precision@5": 0.010526,
-    "recall@5": 0.052632,
-    "hit_rate@5": 0.052632,
-    "ndcg@5": 0.039708,
-    "mrr@5": 0.035526,
-    "users_evaluated": 76
+    "precision@5": 0.002817,
+    "recall@5": 0.014085,
+    "hit_rate@5": 0.014085,
+    "ndcg@5": 0.00598,
+    "mrr@5": 0.003443,
+    "users_evaluated": 213
   },
   "two_tower": {
-    "precision@5": 0.007895,
-    "recall@5": 0.039474,
-    "hit_rate@5": 0.039474,
-    "ndcg@5": 0.031406,
-    "mrr@5": 0.028947,
-    "users_evaluated": 76
+    "precision@5": 0.0,
+    "recall@5": 0.0,
+    "hit_rate@5": 0.0,
+    "ndcg@5": 0.0,
+    "mrr@5": 0.0,
+    "users_evaluated": 213
   }
 }

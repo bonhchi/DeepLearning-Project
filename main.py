@@ -7,7 +7,14 @@ import json
 from pathlib import Path
 
 from src.config import ProjectConfig, ensure_project_dirs
-from src.data.amazon_reviews import DEFAULT_CATEGORIES, first_user_id, iter_huggingface_reviews
+from src.data.amazon_reviews import (
+    DEFAULT_CATEGORIES,
+    SUPPORTED_CATEGORIES,
+    METADATA_CATEGORIES,
+    first_user_id,
+    iter_huggingface_reviews,
+    iter_reviews,
+)
 from src.evaluation.metrics import evaluate_recommenders
 from src.feature_extraction.embeddings import build_and_save_embeddings
 from src.io_utils import read_csv_rows, read_jsonl
@@ -16,9 +23,11 @@ from src.models.popularity import recommend_popular, train_popularity
 from src.models.two_tower import TwoTowerModel
 from src.personalization.recommender import PersonalizedRecommender
 from src.preprocessing.dataset_builder import (
+    append_processed_dataset_from_reviews,
     write_processed_dataset,
     write_processed_dataset_from_reviews,
 )
+from src.preprocessing.metadata_enricher import enrich_product_images
 
 
 def add_data_source_arguments(parser: argparse.ArgumentParser) -> None:
@@ -33,7 +42,7 @@ def add_data_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--categories",
         nargs="+",
-        choices=DEFAULT_CATEGORIES,
+        choices=SUPPORTED_CATEGORIES,
         default=list(DEFAULT_CATEGORIES),
         help="Amazon categories used with --source huggingface.",
     )
@@ -56,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = subparsers.add_parser("prepare", help="Build processed CSV files and embeddings.")
     add_data_source_arguments(prepare)
+    prepare.add_argument(
+        "--append",
+        action="store_true",
+        help="Append reviews to the current processed catalog instead of replacing it.",
+    )
     prepare.add_argument("--max-text-features", type=int, default=160, help="TF-IDF vocabulary size.")
     prepare.add_argument("--image-dim", type=int, default=32, help="Pseudo image embedding size.")
     prepare.add_argument("--metadata-dim", type=int, default=32, help="Metadata embedding size.")
@@ -72,11 +86,33 @@ def build_parser() -> argparse.ArgumentParser:
     recommend = subparsers.add_parser("recommend", help="Print Top-K products for a user.")
     recommend.add_argument("--user-id", default=None, help="User id to recommend for.")
     recommend.add_argument("--top-k", type=int, default=10, help="Number of products to print.")
+    recommend.add_argument("--query", default="", help="Current shopping need in Vietnamese or English.")
 
     all_cmd = subparsers.add_parser("all", help="Run prepare, train, evaluate, and sample recommend.")
     add_data_source_arguments(all_cmd)
     all_cmd.add_argument("--top-k", type=int, default=10, help="K for ranking metrics and recommendations.")
     all_cmd.add_argument("--epochs", type=int, default=3, help="Training epochs.")
+
+    enrich_images = subparsers.add_parser(
+        "enrich-images",
+        help="Stream Amazon item metadata and fill catalog image URLs.",
+    )
+    enrich_images.add_argument(
+        "--categories",
+        nargs="+",
+        choices=METADATA_CATEGORIES,
+        default=None,
+        help="Metadata domains; inferred automatically when omitted.",
+    )
+    enrich_images.add_argument(
+        "--metadata-limit-per-category",
+        type=int,
+        default=0,
+        help="Rows scanned per category; 0 scans until targets are found or the file ends.",
+    )
+    enrich_images.add_argument("--max-text-features", type=int, default=160)
+    enrich_images.add_argument("--image-dim", type=int, default=32)
+    enrich_images.add_argument("--metadata-dim", type=int, default=32)
 
     subparsers.add_parser("app", help="Show the Streamlit command.")
     return parser
@@ -98,12 +134,21 @@ def run_prepare(args: argparse.Namespace, config: ProjectConfig) -> dict:
             limit_per_category=args.limit_per_category,
             progress_callback=print,
         )
-        summary = write_processed_dataset_from_reviews(reviews, config.processed_dir)
+        if getattr(args, "append", False):
+            summary = append_processed_dataset_from_reviews(reviews, config.processed_dir)
+        else:
+            summary = write_processed_dataset_from_reviews(reviews, config.processed_dir)
     else:
         raw_path = Path(args.raw)
         if not raw_path.is_absolute():
             raw_path = config.project_root / raw_path
-        summary = write_processed_dataset(raw_path, config.processed_dir, limit=args.limit)
+        if getattr(args, "append", False):
+            summary = append_processed_dataset_from_reviews(
+                iter_reviews(raw_path, limit=args.limit),
+                config.processed_dir,
+            )
+        else:
+            summary = write_processed_dataset(raw_path, config.processed_dir, limit=args.limit)
     products = read_csv_rows(config.products_path)
     embedding_summary = build_and_save_embeddings(
         products=products,
@@ -135,6 +180,28 @@ def run_train(args: argparse.Namespace, config: ProjectConfig) -> TwoTowerModel:
     model.save(config.two_tower_model_path)
     print(f"Saved model to {config.two_tower_model_path}")
     return model
+
+
+# Bổ sung ảnh catalog thật từ item metadata rồi rebuild embedding sản phẩm.
+def run_enrich_images(args: argparse.Namespace, config: ProjectConfig) -> dict:
+    limit = args.metadata_limit_per_category or None
+    summary = enrich_product_images(
+        config.products_path,
+        categories=args.categories,
+        limit_per_category=limit,
+        progress_callback=print,
+    )
+    products = read_csv_rows(config.products_path)
+    embedding_summary = build_and_save_embeddings(
+        products=products,
+        output_dir=config.embeddings_dir,
+        max_text_features=args.max_text_features,
+        image_dim=args.image_dim,
+        metadata_dim=args.metadata_dim,
+    )
+    summary.update(embedding_summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
 
 
 # Đánh giá các model gợi ý hiện có và ghi báo cáo.
@@ -169,11 +236,19 @@ def run_evaluate(args: argparse.Namespace, config: ProjectConfig) -> dict:
 def run_recommend(args: argparse.Namespace, config: ProjectConfig) -> list[dict]:
     user_id = args.user_id or first_user_id(config.users_path)
     recommender = PersonalizedRecommender.from_project(config.project_root)
-    recommendations = recommender.recommend_for_user(user_id, top_k=args.top_k)
+    if getattr(args, "query", ""):
+        recommendations = recommender.recommend_for_need(args.query, user_id, top_k=args.top_k)
+    else:
+        recommendations = recommender.recommend_for_user(user_id, top_k=args.top_k)
     print(f"User: {user_id}")
     for rank, item in enumerate(recommendations, start=1):
+        match_text = (
+            f" | match={item['match_percentage']:.1f}%"
+            if "match_percentage" in item
+            else ""
+        )
         print(
-            f"{rank:02d}. {item['product_id']} | score={item['score']:.4f} | "
+            f"{rank:02d}. {item['product_id']} | score={item['score']:.4f}{match_text} | "
             f"{item.get('title', '')[:70]} | {item.get('explanation', '')}"
         )
     return recommendations
@@ -193,7 +268,7 @@ def run_all(args: argparse.Namespace, config: ProjectConfig) -> None:
     )
     train_args = argparse.Namespace(epochs=args.epochs, negative_samples=2, dim=48, learning_rate=0.04)
     eval_args = argparse.Namespace(top_k=args.top_k)
-    rec_args = argparse.Namespace(user_id=None, top_k=args.top_k)
+    rec_args = argparse.Namespace(user_id=None, top_k=args.top_k, query="")
     run_prepare(prepare_args, config)
     run_train(train_args, config)
     run_evaluate(eval_args, config)
@@ -219,6 +294,8 @@ def main() -> None:
         run_recommend(args, config)
     elif args.command == "all":
         run_all(args, config)
+    elif args.command == "enrich-images":
+        run_enrich_images(args, config)
     elif args.command == "app":
         print("Run: streamlit run src/app/streamlit_app.py")
 
