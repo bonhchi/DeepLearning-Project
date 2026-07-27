@@ -254,9 +254,43 @@ def main() -> None:
         embedding_dim = len(recommender.vocabulary) + 64
         count_columns[3].metric("Embedding dim", embedding_dim)
         if metrics:
-            st.markdown(benchmark_markdown(metrics))
+            accuracy_keys = ("precision", "recall", "hit_rate", "ndcg", "mrr", "users_evaluated")
+            accuracy_metrics = {
+                model: {
+                    key: value for key, value in values.items()
+                    if key.startswith(accuracy_keys)
+                }
+                for model, values in metrics.items()
+            }
+            health_metrics = {
+                model: {
+                    key: value for key, value in values.items()
+                    if not key.startswith(accuracy_keys)
+                } | {"users_evaluated": values.get("users_evaluated", 0)}
+                for model, values in metrics.items()
+            }
+            st.markdown("**Ranking accuracy**")
+            st.markdown(benchmark_markdown(accuracy_metrics))
+            if any(health_metrics.values()):
+                st.markdown("**Serving health**")
+                st.markdown(benchmark_markdown(health_metrics))
         else:
             st.info("Chưa có metrics. Chạy: python3 main.py evaluate --top-k 5")
+
+        audit = read_json(config.recommendation_audit_path, default={})
+        st.markdown("**Recommendation audit gần nhất**")
+        if audit:
+            audit_columns = st.columns(4)
+            audit_columns[0].metric("Trạng thái", "PASS" if audit.get("audit_passed") else "FAIL")
+            audit_columns[1].metric("Candidates", audit.get("candidate_count_before_seen_filter", 0))
+            audit_columns[2].metric("Shortlist", audit.get("shortlist_total", 0))
+            audit_columns[3].metric("Latency", f"{float(audit.get('total_ms', 0.0)):.1f} ms")
+            with st.expander("Xem trace và các kiểm tra invariant"):
+                st.json(audit)
+        else:
+            st.info(
+                "Chưa có audit log. Chạy: python main.py audit --query \"Tôi cần tai nghe\" --top-k 5"
+            )
 
         st.markdown("**Thông số Two-Tower**")
         if recommender.model:
@@ -276,6 +310,8 @@ def main() -> None:
             "Precision@K đo tỷ lệ item đúng trong Top-K; Recall@K đo phần item liên quan được tìm thấy; "
             "Hit Rate@K đo tỷ lệ user có ít nhất một hit; NDCG@K thưởng hit ở thứ hạng cao; "
             "MRR@K đo nghịch đảo thứ hạng của hit đầu tiên."
+            " Coverage đo độ phủ catalog; leakage phải bằng 0; out-of-catalog phải bằng 0; "
+            "latency là thời gian trung bình cho mỗi user."
         )
 
 

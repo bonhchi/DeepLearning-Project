@@ -84,6 +84,26 @@ python3 main.py evaluate --top-k 10
 python3 main.py recommend --top-k 10
 ```
 
+## Audit và benchmark thuật toán
+
+Ghi trace chi tiết cho một nhu cầu: category được nhận diện, số candidate, shortlist,
+thành phần điểm, thời gian từng pha và các invariant:
+
+```cmd
+.venv\Scripts\python.exe main.py audit --query "Tôi cần tai nghe điện tử chất lượng tốt" --top-k 5
+```
+
+Log được lưu tại `outputs/reports/recommendation_audit.json` và hiển thị trong tab
+Benchmark. Chạy lại benchmark mở rộng sau khi prepare/train:
+
+```cmd
+.venv\Scripts\python.exe main.py evaluate --top-k 5
+```
+
+Ngoài Precision/Recall/NDCG/MRR, báo cáo còn có catalog coverage, độ dài danh sách,
+duplicate rate, seen-item leakage, out-of-catalog rate, latency và độ phủ artifact.
+Leakage, duplicate và out-of-catalog nên bằng `0`; artifact coverage nên gần `1`.
+
 ## Demo
 
 ```bash

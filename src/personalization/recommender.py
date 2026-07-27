@@ -6,6 +6,7 @@ import math
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
+from time import perf_counter
 
 from src.config import ProjectConfig
 from src.feature_extraction.embeddings import product_text, tokenize
@@ -106,10 +107,21 @@ NEED_TOKEN_EXPANSIONS = {
     "lanh": {"refrigerator", "fridge"},
 }
 
+NEED_PHRASE_EXPANSIONS = {
+    "tai nghe": {"headphone", "headphones", "earbud", "earbuds", "earphone"},
+    "dien thoai": {"phone", "smartphone"},
+    "may tinh": {"computer", "laptop", "desktop"},
+    "cham soc da": {"skincare", "skin", "cream", "serum"},
+    "ao thun": {"shirt", "tshirt", "tee"},
+}
+
 
 def _ascii_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value.lower())
-    return "".join(character for character in normalized if not unicodedata.combining(character))
+    without_accents = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return without_accents.replace("đ", "d")
 
 
 def _unit_cosine(left: list[float], right: list[float]) -> float:
@@ -254,14 +266,16 @@ class PersonalizedRecommender:
 
     # Chuẩn hóa điểm cá nhân hóa về [0, 1] để có thể kết hợp và giải thích.
     def _personalization_score(self, user_id: str, product_id: str) -> float:
+        # Không có user/profile thì dùng mức trung tính; popularity đã có trọng số riêng 5%.
+        if not user_id:
+            return 0.5
         if self.model and user_id in self.model.user_embeddings:
             return sigmoid(self.model.score(user_id, product_id))
         profile = self.user_profiles.get(user_id)
         vector = self.product_embeddings.get(product_id)
         if profile and vector:
             return _unit_cosine(profile, vector)
-        popularity = self.popularity_scores.get(product_id, 0.0)
-        return math.log1p(popularity) / max(math.log1p(self.max_popularity), 1.0)
+        return 0.5
 
     # Tính mức độ item đáp ứng trực tiếp câu nhu cầu.
     def _need_score(
@@ -287,10 +301,39 @@ class PersonalizedRecommender:
         user_id: str = "",
         top_k: int = 5,
         prefer_images: bool = True,
+        trace: dict | None = None,
     ) -> list[dict]:
+        started_at = perf_counter()
         clean_need = need.strip()
+        if trace is not None:
+            trace.clear()
+            trace.update(
+                {
+                    "query": clean_need,
+                    "user_id": user_id,
+                    "top_k": top_k,
+                    "prefer_images": prefer_images,
+                    "catalog_products": len(self.products),
+                    "weights": {
+                        "need": 0.60,
+                        "personalization": 0.20,
+                        "quality": 0.15,
+                        "popularity": 0.05,
+                    },
+                }
+            )
         if not clean_need:
-            return self.recommend_for_user(user_id, top_k=top_k)
+            results = self.recommend_for_user(user_id, top_k=top_k)
+            if trace is not None:
+                trace.update(
+                    {
+                        "status": "fallback_user_recommendation",
+                        "returned_count": len(results),
+                        "total_ms": round((perf_counter() - started_at) * 1000, 3),
+                    }
+                )
+            return results
+        resolve_started_at = perf_counter()
         inferred_categories = self.infer_need_categories(clean_need)
         candidate_categories, missing_categories = self.resolve_need_categories(clean_need)
         need_tokens = {
@@ -298,7 +341,30 @@ class PersonalizedRecommender:
         }
         for token in tuple(need_tokens):
             need_tokens.update(NEED_TOKEN_EXPANSIONS.get(token, set()))
+        normalized_need = _ascii_text(clean_need)
+        for phrase, expansions in NEED_PHRASE_EXPANSIONS.items():
+            if phrase in normalized_need:
+                need_tokens.update(expansions)
+        if trace is not None:
+            trace.update(
+                {
+                    "inferred_intents": inferred_categories,
+                    "resolved_categories": candidate_categories,
+                    "missing_categories": missing_categories,
+                    "need_tokens": sorted(need_tokens),
+                    "resolve_ms": round((perf_counter() - resolve_started_at) * 1000, 3),
+                }
+            )
         if missing_categories:
+            if trace is not None:
+                trace.update(
+                    {
+                        "status": "missing_category",
+                        "returned_count": 0,
+                        "total_ms": round((perf_counter() - started_at) * 1000, 3),
+                        "warnings": ["Nhu cầu thuộc category chưa có trong catalog."],
+                    }
+                )
             return []
         candidate_ids = [
             product_id
@@ -308,8 +374,16 @@ class PersonalizedRecommender:
         if not candidate_ids:
             candidate_ids = self.product_ids
         seen = self.seen_by_user.get(user_id, set())
+        if trace is not None:
+            trace.update(
+                {
+                    "candidate_count_before_seen_filter": len(candidate_ids),
+                    "seen_products_for_user": len(seen),
+                }
+            )
 
         # Pha 1 chỉ dùng scalar rẻ để thu hẹp catalog lớn trước khi tokenize/vector scoring.
+        phase_1_started_at = perf_counter()
         preliminary = []
         for product_id in candidate_ids:
             if product_id in seen:
@@ -341,8 +415,20 @@ class PersonalizedRecommender:
             row for row in preliminary if not str(self.products[row[0]].get("image_url", "")).strip()
         ][:shortlist_size]
         shortlist_ids = [product_id for product_id, _ in [*image_shortlist, *other_shortlist]]
+        if trace is not None:
+            trace.update(
+                {
+                    "candidate_count_after_seen_filter": len(preliminary),
+                    "shortlist_limit_per_image_group": shortlist_size,
+                    "shortlist_with_images": len(image_shortlist),
+                    "shortlist_without_images": len(other_shortlist),
+                    "shortlist_total": len(shortlist_ids),
+                    "phase_1_ms": round((perf_counter() - phase_1_started_at) * 1000, 3),
+                }
+            )
 
         # Pha 2 mới tính lexical và personalization trên tối đa khoảng 1.000 ứng viên.
+        phase_2_started_at = perf_counter()
         scored = []
         for product_id in shortlist_ids:
             product = self.products[product_id]
@@ -363,6 +449,13 @@ class PersonalizedRecommender:
                 row for row in scored if not str(self.products[row[0]].get("image_url", "")).strip()
             ]
             scored = [*with_images, *without_images]
+        if trace is not None:
+            trace.update(
+                {
+                    "scored_count": len(scored),
+                    "phase_2_ms": round((perf_counter() - phase_2_started_at) * 1000, 3),
+                }
+            )
 
         results = []
         for product_id, total, need_score, personalization, quality, popularity, matched in scored[:top_k]:
@@ -382,8 +475,38 @@ class PersonalizedRecommender:
                 "Chất lượng": round(quality * 100, 1),
                 "Phổ biến": round(popularity * 100, 1),
             }
+            item["matched_need_tokens"] = matched
             item["explanation"] = "Được chọn vì " + "; ".join(reasons) + "."
             results.append(item)
+        if trace is not None:
+            result_ids = [item["product_id"] for item in results]
+            trace.update(
+                {
+                    "status": "ok" if results else "no_candidates",
+                    "returned_count": len(results),
+                    "unique_returned_count": len(set(result_ids)),
+                    "seen_item_leakage_count": len(set(result_ids) & seen),
+                    "image_result_count": sum(bool(item.get("image_url")) for item in results),
+                    "top_results": [
+                        {
+                            "rank": rank,
+                            "product_id": item["product_id"],
+                            "title": item.get("title", ""),
+                            "category": item.get("category", ""),
+                            "score": round(float(item.get("score", 0.0)), 6),
+                            "score_breakdown": item.get("score_breakdown", {}),
+                            "matched_need_tokens": item.get("matched_need_tokens", []),
+                        }
+                        for rank, item in enumerate(results, start=1)
+                    ],
+                    "total_ms": round((perf_counter() - started_at) * 1000, 3),
+                }
+            )
+            semantic_matches = sum(bool(item.get("matched_need_tokens")) for item in results)
+            trace["semantic_match_result_count"] = semantic_matches
+            trace["semantic_match_result_rate"] = round(
+                semantic_matches / max(len(results), 1), 6
+            )
         return results
 
     # Trả về Top-K sản phẩm cá nhân hóa kèm điểm và giải thích.

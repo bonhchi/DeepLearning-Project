@@ -66,6 +66,36 @@ class NeedRecommenderTests(unittest.TestCase):
         self.assertIn("Nhu cầu", rows[0]["score_breakdown"])
         self.assertIn("Được chọn vì", rows[0]["explanation"])
 
+    def test_need_trace_records_pipeline_counts_and_top_results(self) -> None:
+        trace = {}
+
+        rows = self.recommender.recommend_for_need(
+            "Tôi cần tai nghe điện tử",
+            top_k=2,
+            trace=trace,
+        )
+
+        self.assertEqual(trace["status"], "ok")
+        self.assertEqual(trace["candidate_count_before_seen_filter"], 2)
+        self.assertEqual(trace["returned_count"], len(rows))
+        self.assertEqual(trace["seen_item_leakage_count"], 0)
+        self.assertEqual(trace["top_results"][0]["product_id"], rows[0]["product_id"])
+        self.assertIn("headphone", trace["need_tokens"])
+        self.assertGreater(trace["semantic_match_result_count"], 0)
+        self.assertGreaterEqual(trace["total_ms"], 0.0)
+
+    def test_vietnamese_d_stroke_is_normalized(self) -> None:
+        self.assertEqual(
+            self.recommender.infer_need_categories("Tôi cần đồ điện tử"),
+            ["Electronics"],
+        )
+
+    def test_cold_start_personalization_is_neutral_not_popularity(self) -> None:
+        self.assertEqual(
+            self.recommender._personalization_score("", "electronic-good"),
+            0.5,
+        )
+
     def test_similar_products_stay_in_functional_category(self) -> None:
         rows = self.recommender.similar_products("electronic-good", top_k=5)
 

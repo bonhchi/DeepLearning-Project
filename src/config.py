@@ -77,6 +77,11 @@ class ProjectConfig:
     def metrics_path(self) -> Path:
         return self.reports_dir / "metrics.json"
 
+    # Trace chi tiết của lần audit recommendation gần nhất.
+    @property
+    def recommendation_audit_path(self) -> Path:
+        return self.reports_dir / "recommendation_audit.json"
+
 
 # Tạo các thư mục cần thiết của dự án nếu chưa tồn tại.
 def ensure_project_dirs(config: ProjectConfig) -> None:

@@ -1,0 +1,163 @@
+{
+  "query": "Tôi cần tai nghe điện tử chất lượng tốt",
+  "user_id": "",
+  "top_k": 5,
+  "prefer_images": true,
+  "catalog_products": 307637,
+  "weights": {
+    "need": 0.6,
+    "personalization": 0.2,
+    "quality": 0.15,
+    "popularity": 0.05
+  },
+  "inferred_intents": [
+    "Electronics"
+  ],
+  "resolved_categories": [
+    "Electronics"
+  ],
+  "missing_categories": [],
+  "need_tokens": [
+    "chat",
+    "dien",
+    "earbud",
+    "earbuds",
+    "earphone",
+    "headphone",
+    "headphones",
+    "luong",
+    "nghe",
+    "tai"
+  ],
+  "resolve_ms": 0.099,
+  "candidate_count_before_seen_filter": 59429,
+  "seen_products_for_user": 0,
+  "candidate_count_after_seen_filter": 59429,
+  "shortlist_limit_per_image_group": 500,
+  "shortlist_with_images": 500,
+  "shortlist_without_images": 500,
+  "shortlist_total": 1000,
+  "phase_1_ms": 327.266,
+  "scored_count": 1000,
+  "phase_2_ms": 41.282,
+  "status": "ok",
+  "returned_count": 5,
+  "unique_returned_count": 5,
+  "seen_item_leakage_count": 0,
+  "image_result_count": 5,
+  "top_results": [
+    {
+      "rank": 1,
+      "product_id": "B0BV2BDGV7",
+      "title": "Very impressed so far",
+      "category": "Electronics",
+      "score": 0.82973,
+      "score_breakdown": {
+        "Nhu cầu": 95.0,
+        "Cá nhân hóa": 50.0,
+        "Chất lượng": 100.0,
+        "Phổ biến": 19.5
+      },
+      "matched_need_tokens": [
+        "earbud",
+        "earbuds",
+        "headphones"
+      ]
+    },
+    {
+      "rank": 2,
+      "product_id": "B08GBXQ63G",
+      "title": "I've bought sooooo many of these.... it's not them, it's me...",
+      "category": "Electronics",
+      "score": 0.825493,
+      "score_breakdown": {
+        "Nhu cầu": 95.0,
+        "Cá nhân hóa": 50.0,
+        "Chất lượng": 100.0,
+        "Phổ biến": 11.0
+      },
+      "matched_need_tokens": [
+        "earbud",
+        "earbuds",
+        "headphones"
+      ]
+    },
+    {
+      "rank": 3,
+      "product_id": "B0BTP3N2HC",
+      "title": "Works pretty good",
+      "category": "Electronics",
+      "score": 0.825325,
+      "score_breakdown": {
+        "Nhu cầu": 95.0,
+        "Cá nhân hóa": 50.0,
+        "Chất lượng": 95.0,
+        "Phổ biến": 25.6
+      },
+      "matched_need_tokens": [
+        "earbuds",
+        "headphone",
+        "headphones"
+      ]
+    },
+    {
+      "rank": 4,
+      "product_id": "B07ZFDV9VC",
+      "title": "I LOVE these buds!!",
+      "category": "Electronics",
+      "score": 0.823466,
+      "score_breakdown": {
+        "Nhu cầu": 95.0,
+        "Cá nhân hóa": 50.0,
+        "Chất lượng": 100.0,
+        "Phổ biến": 6.9
+      },
+      "matched_need_tokens": [
+        "earbud",
+        "earbuds",
+        "headphones"
+      ]
+    },
+    {
+      "rank": 5,
+      "product_id": "B09X2XNHJZ",
+      "title": "I like these headphone styling",
+      "category": "Electronics",
+      "score": 0.823466,
+      "score_breakdown": {
+        "Nhu cầu": 95.0,
+        "Cá nhân hóa": 50.0,
+        "Chất lượng": 100.0,
+        "Phổ biến": 6.9
+      },
+      "matched_need_tokens": [
+        "earbuds",
+        "headphone",
+        "headphones"
+      ]
+    }
+  ],
+  "total_ms": 370.128,
+  "semantic_match_result_count": 5,
+  "semantic_match_result_rate": 1.0,
+  "artifact_health": {
+    "catalog_items": 307637,
+    "model_items": 3877,
+    "model_catalog_coverage": 0.012603,
+    "model_out_of_catalog_items": 0
+  },
+  "warnings": [
+    "Two-Tower model covers less than 80% of the current catalog; retrain after data changes."
+  ],
+  "checks": {
+    "returned_at_most_top_k": true,
+    "no_duplicate_products": true,
+    "no_seen_item_leakage": true,
+    "all_results_exist_in_catalog": true,
+    "all_results_match_resolved_category": true,
+    "score_formula_matches_breakdown": true,
+    "model_catalog_coverage_acceptable": false
+  },
+  "score_formula_error_products": [],
+  "audit_passed": false
+}

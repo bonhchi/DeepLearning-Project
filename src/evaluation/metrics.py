@@ -4,12 +4,30 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from time import perf_counter
 from typing import Callable
 
 from src.io_utils import parse_int
 
 
 RecommendationFn = Callable[[str, set[str], int], list[tuple[str, float]]]
+
+
+def artifact_catalog_health(
+    artifact_product_ids: set[str],
+    catalog_product_ids: set[str],
+) -> dict[str, float]:
+    """Kiểm tra artifact model/embedding còn đồng bộ với catalog hiện tại hay không."""
+    return {
+        "artifact_catalog_coverage": round(
+            len(artifact_product_ids & catalog_product_ids) / max(len(catalog_product_ids), 1),
+            6,
+        ),
+        "artifact_out_of_catalog_rate": round(
+            len(artifact_product_ids - catalog_product_ids) / max(len(artifact_product_ids), 1),
+            6,
+        ),
+    }
 
 
 # Tính Precision@K cho một user.
@@ -93,18 +111,71 @@ def evaluate_recommendations(
     }
 
 
+def evaluate_serving_health(
+    recommendations_by_user: dict[str, list[str]],
+    seen_by_user: dict[str, set[str]],
+    relevant_by_user: dict[str, set[str]],
+    catalog_product_ids: set[str],
+    top_k: int,
+    elapsed_ms: float,
+) -> dict[str, float]:
+    """Đo coverage, trùng lặp, rò rỉ train và độ trễ của output recommender."""
+    users = [user_id for user_id in relevant_by_user if relevant_by_user[user_id]]
+    lists = [recommendations_by_user.get(user_id, [])[:top_k] for user_id in users]
+    total_recommended = sum(len(rows) for rows in lists)
+    unique_recommended = {product_id for rows in lists for product_id in rows}
+    duplicate_count = sum(len(rows) - len(set(rows)) for rows in lists)
+    seen_leakage = sum(
+        product_id in seen_by_user.get(user_id, set())
+        for user_id, rows in zip(users, lists)
+        for product_id in rows
+    )
+    out_of_catalog = sum(
+        product_id not in catalog_product_ids for rows in lists for product_id in rows
+    )
+    relevant_items = {
+        product_id for user_id in users for product_id in relevant_by_user.get(user_id, set())
+    }
+    return {
+        f"catalog_coverage@{top_k}": round(
+            len(unique_recommended & catalog_product_ids) / max(len(catalog_product_ids), 1), 6
+        ),
+        f"avg_list_size@{top_k}": round(total_recommended / max(len(users), 1), 6),
+        f"duplicate_rate@{top_k}": round(duplicate_count / max(total_recommended, 1), 6),
+        f"seen_leakage_rate@{top_k}": round(seen_leakage / max(total_recommended, 1), 6),
+        f"out_of_catalog_rate@{top_k}": round(out_of_catalog / max(total_recommended, 1), 6),
+        "relevant_in_catalog_rate": round(
+            len(relevant_items & catalog_product_ids) / max(len(relevant_items), 1), 6
+        ),
+        "latency_ms_per_user": round(elapsed_ms / max(len(users), 1), 3),
+    }
 # Chạy nhiều recommender trên cùng tập user test giữ lại.
 def evaluate_recommenders(
     interactions: list[dict],
     recommenders: dict[str, RecommendationFn],
     top_k: int = 10,
+    catalog_product_ids: set[str] | None = None,
 ) -> dict[str, dict[str, float]]:
     seen_by_user, relevant_by_user = build_eval_sets(interactions)
+    catalog = catalog_product_ids or {
+        row["product_id"] for row in interactions if row.get("product_id")
+    }
     results = {}
     for name, recommender in recommenders.items():
+        started_at = perf_counter()
         recommendations_by_user = {}
         for user_id in relevant_by_user:
             rows = recommender(user_id, seen_by_user.get(user_id, set()), top_k)
             recommendations_by_user[user_id] = [product_id for product_id, _ in rows]
-        results[name] = evaluate_recommendations(recommendations_by_user, relevant_by_user, top_k)
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        results[name] = evaluate_recommendations(
+            recommendations_by_user, relevant_by_user, top_k
+        ) | evaluate_serving_health(
+            recommendations_by_user,
+            seen_by_user,
+            relevant_by_user,
+            catalog,
+            top_k,
+            elapsed_ms,
+        )
     return results

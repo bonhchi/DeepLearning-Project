@@ -15,7 +15,7 @@ from src.data.amazon_reviews import (
     iter_huggingface_reviews,
     iter_reviews,
 )
-from src.evaluation.metrics import evaluate_recommenders
+from src.evaluation.metrics import artifact_catalog_health, evaluate_recommenders
 from src.feature_extraction.embeddings import build_and_save_embeddings
 from src.io_utils import read_csv_rows, read_jsonl
 from src.models.content_based import build_user_profiles, recommend_content
@@ -87,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     recommend.add_argument("--user-id", default=None, help="User id to recommend for.")
     recommend.add_argument("--top-k", type=int, default=10, help="Number of products to print.")
     recommend.add_argument("--query", default="", help="Current shopping need in Vietnamese or English.")
+
+    audit = subparsers.add_parser(
+        "audit",
+        help="Trace one need-based recommendation and validate ranking invariants.",
+    )
+    audit.add_argument("--query", required=True, help="Shopping need to trace.")
+    audit.add_argument("--user-id", default="", help="Optional user id for personalization.")
+    audit.add_argument("--top-k", type=int, default=5, help="Number of results to inspect.")
 
     all_cmd = subparsers.add_parser("all", help="Run prepare, train, evaluate, and sample recommend.")
     add_data_source_arguments(all_cmd)
@@ -226,7 +234,23 @@ def run_evaluate(args: argparse.Namespace, config: ProjectConfig) -> dict:
     if model is not None:
         recommenders["two_tower"] = lambda user_id, seen, k: model.recommend(user_id, seen, k)
 
-    metrics = evaluate_recommenders(interactions, recommenders, top_k=args.top_k)
+    metrics = evaluate_recommenders(
+        interactions,
+        recommenders,
+        top_k=args.top_k,
+        catalog_product_ids=set(product_ids),
+    )
+    catalog_ids = set(product_ids)
+    metrics["popularity"].update(
+        artifact_catalog_health(set(popularity_scores), catalog_ids)
+    )
+    metrics["content_based"].update(
+        artifact_catalog_health(set(embeddings), catalog_ids)
+    )
+    if model is not None and "two_tower" in metrics:
+        metrics["two_tower"].update(
+            artifact_catalog_health(set(model.item_embeddings), catalog_ids)
+        )
     config.metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     return metrics
@@ -252,6 +276,75 @@ def run_recommend(args: argparse.Namespace, config: ProjectConfig) -> list[dict]
             f"{item.get('title', '')[:70]} | {item.get('explanation', '')}"
         )
     return recommendations
+
+
+# Ghi trace một truy vấn và kiểm tra các invariant quan trọng của serving pipeline.
+def run_audit(args: argparse.Namespace, config: ProjectConfig) -> dict:
+    recommender = PersonalizedRecommender.from_project(config.project_root, load_embeddings=False)
+    trace: dict = {}
+    recommendations = recommender.recommend_for_need(
+        args.query,
+        args.user_id,
+        top_k=args.top_k,
+        trace=trace,
+    )
+    result_ids = [item["product_id"] for item in recommendations]
+    resolved_categories = set(trace.get("resolved_categories", []))
+    score_formula_errors = []
+    for item in recommendations:
+        breakdown = item.get("score_breakdown", {})
+        reconstructed = (
+            0.60 * float(breakdown.get("Nhu cầu", 0.0))
+            + 0.20 * float(breakdown.get("Cá nhân hóa", 0.0))
+            + 0.15 * float(breakdown.get("Chất lượng", 0.0))
+            + 0.05 * float(breakdown.get("Phổ biến", 0.0))
+        ) / 100.0
+        if abs(reconstructed - float(item.get("score", 0.0))) > 0.002:
+            score_formula_errors.append(item["product_id"])
+    model_items = set(recommender.model.item_embeddings) if recommender.model else set()
+    catalog_items = set(recommender.products)
+    trace["artifact_health"] = {
+        "catalog_items": len(catalog_items),
+        "model_items": len(model_items),
+        "model_catalog_coverage": round(
+            len(model_items & catalog_items) / max(len(catalog_items), 1), 6
+        ),
+        "model_out_of_catalog_items": len(model_items - catalog_items),
+    }
+    warnings = list(trace.get("warnings", []))
+    if model_items and trace["artifact_health"]["model_catalog_coverage"] < 0.8:
+        warnings.append(
+            "Two-Tower model covers less than 80% of the current catalog; retrain after data changes."
+        )
+    if recommendations and trace.get("semantic_match_result_count", 0) == 0:
+        warnings.append(
+            "Top-K only matches the broad category; no query keyword matched product text."
+        )
+    trace["warnings"] = warnings
+    trace["checks"] = {
+        "returned_at_most_top_k": len(result_ids) <= args.top_k,
+        "no_duplicate_products": len(result_ids) == len(set(result_ids)),
+        "no_seen_item_leakage": trace.get("seen_item_leakage_count", 0) == 0,
+        "all_results_exist_in_catalog": all(item_id in catalog_items for item_id in result_ids),
+        "all_results_match_resolved_category": all(
+            not resolved_categories
+            or recommender.products[item_id].get("category") in resolved_categories
+            for item_id in result_ids
+        ),
+        "score_formula_matches_breakdown": not score_formula_errors,
+        "model_catalog_coverage_acceptable": (
+            not model_items or trace["artifact_health"]["model_catalog_coverage"] >= 0.8
+        ),
+    }
+    trace["score_formula_error_products"] = score_formula_errors
+    trace["audit_passed"] = all(trace["checks"].values())
+    config.recommendation_audit_path.write_text(
+        json.dumps(trace, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(json.dumps(trace, indent=2, ensure_ascii=False))
+    print(f"Saved audit log to {config.recommendation_audit_path}")
+    return trace
 
 
 # Chạy toàn bộ workflow MVP trên subset có giới hạn.
@@ -292,6 +385,8 @@ def main() -> None:
         run_evaluate(args, config)
     elif args.command == "recommend":
         run_recommend(args, config)
+    elif args.command == "audit":
+        run_audit(args, config)
     elif args.command == "all":
         run_all(args, config)
     elif args.command == "enrich-images":
