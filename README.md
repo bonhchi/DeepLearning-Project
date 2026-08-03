@@ -26,6 +26,99 @@ main.py                  CLI workflow
 python3 -m pip install -r requirements.txt
 ```
 
+## Thiết lập trên macOS
+
+Project chạy được trên cả Mac Apple Silicon (M1/M2/M3/M4) và Mac Intel. Pipeline
+ingest/training hiện dùng Python standard library và Streamlit, không phụ thuộc NumPy,
+Pandas hay `datasets`, nên không cần môi trường Conda.
+
+### 1. Cài Python
+
+Yêu cầu Python 3.10 trở lên. Kiểm tra trước:
+
+```bash
+python3 --version
+```
+
+Nếu chưa có Python phù hợp và đã cài [Homebrew](https://brew.sh/):
+
+```bash
+brew install python@3.12
+python3.12 --version
+```
+
+Chỉ khi `pip install` báo lỗi compiler/toolchain, cài Command Line Tools của Apple:
+
+```bash
+xcode-select --install
+```
+
+### 2. Tạo môi trường và cài dependency
+
+Mở Terminal, vào thư mục source rồi chạy:
+
+```bash
+cd /duong-dan/DeepLearning
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Mỗi lần mở Terminal mới, kích hoạt lại môi trường bằng:
+
+```bash
+cd /duong-dan/DeepLearning
+source .venv/bin/activate
+```
+
+### 3. Chạy demo và CLI trên Mac
+
+```bash
+python -m streamlit run src/app/streamlit_app.py
+```
+
+Sau đó mở URL Streamlit in ra trong Terminal, thông thường là
+`http://localhost:8501`.
+
+Các lệnh workflow tương đương Windows CMD:
+
+```bash
+python main.py audit --query "Tôi cần tai nghe điện tử chất lượng tốt" --top-k 5
+python main.py recommend --query "Tôi cần áo thun thoải mái" --top-k 5
+python main.py train --epochs 3
+python main.py evaluate --top-k 5
+```
+
+`train` và `evaluate` cần đọc embedding lớn, vì vậy hãy để trống dung lượng đĩa và
+chạy chúng trong Terminal riêng. Dùng `Ctrl+C` để dừng tác vụ đang chạy.
+
+### 4. Chuyển hoặc tạo dữ liệu trên Mac
+
+Thư mục `data/` và `dataset/` bị Git ignore vì rất lớn; clone source không tự mang
+theo catalog, embedding hay file Fashion JSONL. Có hai lựa chọn:
+
+1. Copy các thư mục `data/` và, nếu dùng Fashion local, `dataset/Amazon_Fashion.jsonl`
+   từ máy Windows/ổ cứng ngoài sang đúng thư mục project trên Mac. Có thể chạy app ngay
+   nếu đã copy cả `data/processed`, `data/embeddings` và `outputs/models`.
+2. Tạo một subset mới trực tiếp trên Mac qua Hugging Face streaming:
+
+   ```bash
+   python main.py prepare --source huggingface --limit-per-category 1000
+   python main.py train --epochs 3
+   python main.py evaluate --top-k 5
+   ```
+
+Để kiểm tra dữ liệu/model sau khi copy hoặc prepare, luôn chạy audit trước:
+
+```bash
+python main.py audit --query "Tôi cần tai nghe điện tử chất lượng tốt" --top-k 5
+```
+
+Nếu audit báo `model_catalog_coverage` thấp, catalog đã thay đổi nhưng Two-Tower chưa
+được train lại; chạy `python main.py train --epochs 3` trước khi dùng benchmark làm kết luận.
+
 ## Demo Hugging Face nhỏ
 
 Nên chạy smoke test trước. Lệnh dưới chỉ đọc 1.000 review cho mỗi category (tổng tối đa 4.000):
