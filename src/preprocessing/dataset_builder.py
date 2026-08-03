@@ -3,15 +3,36 @@
 from __future__ import annotations
 
 import math
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
 from src.data.amazon_reviews import iter_reviews
-from src.io_utils import parse_float, parse_int, parse_bool, read_csv_rows, write_csv_rows
+from src.io_utils import (
+    json_loads_safe,
+    parse_float,
+    parse_int,
+    parse_bool,
+    read_csv_rows,
+    write_csv_rows,
+)
 from src.vector_ops import stable_hash_int
 
 
+REVIEW_TRAIN_METADATA_SOURCE = "review_train_aggregate"
+AMAZON_ITEM_METADATA_SOURCE = "amazon_item_metadata"
+AMAZON_METADATA_FIELDS = (
+    "title",
+    "store",
+    "price",
+    "average_rating",
+    "rating_number",
+    "description",
+    "features",
+    "image_url",
+    "preferred_price_range",
+)
 PRODUCT_FIELDS = [
     "product_id",
     "title",
@@ -24,7 +45,87 @@ PRODUCT_FIELDS = [
     "features",
     "image_url",
     "preferred_price_range",
+    "metadata_source",
+    "metadata_provenance",
 ]
+
+REVIEW_FIELDS = [
+    "user_id",
+    "product_id",
+    "review_title",
+    "review_text",
+    "rating",
+    "timestamp",
+    "helpful_vote",
+    "verified_purchase",
+    "image_url",
+    "source_category",
+]
+DATASET_MANIFEST_VERSION = 1
+
+
+def write_dataset_manifest(output_dir: str | Path) -> Path:
+    """Certify the temporal/provenance rules used by the processed tables."""
+
+    target = Path(output_dir) / "dataset_manifest.json"
+    payload = {
+        "artifact_version": DATASET_MANIFEST_VERSION,
+        "leakage_safe": True,
+        "interaction_split": "per_user_chronological_cutoff",
+        "product_review_features": "train_events_only",
+        "user_profiles": "train_events_only",
+        "review_join": "user_product_exact_raw_timestamp",
+        "metadata_provenance": "field_level",
+        "business_inventory": "deterministic_demo_proxy_not_live_stock",
+    }
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
+def parse_metadata_provenance(product: dict) -> dict[str, str]:
+    """Return field-level provenance from either in-memory or CSV products.
+
+    Legacy catalogs have neither provenance column.  Treating those fields as
+    unverified is deliberately conservative: append will rebuild them from the
+    newly computed train split instead of preserving potentially held-out text.
+    """
+
+    value = json_loads_safe(product.get("metadata_provenance"), {})
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(field): str(source)
+        for field, source in value.items()
+        if str(field) and str(source)
+    }
+
+
+def overlay_verified_amazon_metadata(rebuilt: dict, existing: dict | None) -> dict:
+    """Restore only fields explicitly proven to come from Amazon item metadata."""
+
+    if not existing:
+        return rebuilt
+    existing_provenance = parse_metadata_provenance(existing)
+    restored_fields: list[str] = []
+    for field in AMAZON_METADATA_FIELDS:
+        if existing_provenance.get(field) != AMAZON_ITEM_METADATA_SOURCE:
+            continue
+        value = existing.get(field)
+        if value in (None, ""):
+            continue
+        if field == "features":
+            value = json_loads_safe(value, value)
+        rebuilt[field] = value
+        restored_fields.append(field)
+
+    if restored_fields:
+        provenance = parse_metadata_provenance(rebuilt)
+        provenance.update({field: AMAZON_ITEM_METADATA_SOURCE for field in restored_fields})
+        rebuilt["metadata_source"] = AMAZON_ITEM_METADATA_SOURCE
+        rebuilt["metadata_provenance"] = provenance
+    return rebuilt
 
 
 # Chuyển timestamp mili-giây thành bucket ngày dạng số nguyên.
@@ -127,19 +228,30 @@ def session_id_for(review: dict) -> str:
     return f"s_{stable_hash_int(user_id + str(day), 10**14)}"
 
 
-# Chia train/validation/test theo chiến lược giữ lại tương tác cuối của mỗi user.
+# Chia theo timeline user; mọi event sau cutoff holdout đều không thể quay lại train.
 def split_interactions(interactions: list[dict]) -> list[dict]:
-    positive_by_user: dict[str, list[dict]] = defaultdict(list)
+    rows_by_user: dict[str, list[dict]] = defaultdict(list)
     for row in interactions:
-        if parse_int(row.get("label"), 0) == 1:
-            positive_by_user[row["user_id"]].append(row)
         row["split"] = "train"
-    for rows in positive_by_user.values():
-        rows.sort(key=lambda item: parse_int(item.get("timestamp"), 0))
-        if len(rows) >= 2:
-            rows[-1]["split"] = "test"
-        if len(rows) >= 3:
-            rows[-2]["split"] = "val"
+        rows_by_user[row["user_id"]].append(row)
+    for user_rows in rows_by_user.values():
+        positive_timestamps = sorted(
+            parse_int(row.get("timestamp"), 0)
+            for row in user_rows
+            if parse_int(row.get("label"), 0) == 1
+        )
+        if len(positive_timestamps) < 2:
+            continue
+        test_cutoff = positive_timestamps[-1]
+        validation_cutoff = (
+            positive_timestamps[-2] if len(positive_timestamps) >= 3 else None
+        )
+        for row in user_rows:
+            timestamp = parse_int(row.get("timestamp"), 0)
+            if timestamp >= test_cutoff:
+                row["split"] = "test"
+            elif validation_cutoff is not None and timestamp >= validation_cutoff:
+                row["split"] = "val"
     return interactions
 
 
@@ -179,7 +291,18 @@ def top_keywords(text: str, limit: int = 8) -> list[str]:
 
 
 # Gom review để tạo bảng metadata sản phẩm gọn trong bộ nhớ.
-def build_products(reviews: list[dict]) -> list[dict]:
+def build_products(
+    reviews: list[dict],
+    training_review_keys: set[tuple[str, str, int]] | None = None,
+) -> list[dict]:
+    """Build catalog features without reading held-out review content.
+
+    Product identity and source category are catalog-level fields and may use all
+    rows. Rating aggregates, title, description, keywords and review images only
+    use rows whose exact event key belongs to the training split when
+    ``training_review_keys`` is provided.
+    """
+
     grouped: dict[str, dict] = {}
     for review in reviews:
         product_id = review["product_id"]
@@ -195,6 +318,15 @@ def build_products(reviews: list[dict]) -> list[dict]:
                 "title": "",
             },
         )
+        if review.get("source_category"):
+            stats["category_counts"][str(review["source_category"])] += 1
+        review_key = (
+            str(review.get("user_id", "")),
+            str(review.get("product_id", "")),
+            parse_int(review.get("timestamp"), 0),
+        )
+        if training_review_keys is not None and review_key not in training_review_keys:
+            continue
         stats["rating_sum"] += parse_float(review.get("rating"), 0.0)
         stats["rating_count"] += 1
         review_text = f"{review.get('review_title', '')} {review.get('review_text', '')}".strip()
@@ -202,8 +334,6 @@ def build_products(reviews: list[dict]) -> list[dict]:
             stats["text_parts"].append(review_text)
         if len(stats["description_parts"]) < 3 and review.get("review_text"):
             stats["description_parts"].append(str(review["review_text"]))
-        if review.get("source_category"):
-            stats["category_counts"][str(review["source_category"])] += 1
         if not stats["image_url"] and review.get("image_url"):
             stats["image_url"] = str(review["image_url"])
         if not stats["title"] and review.get("review_title"):
@@ -236,6 +366,19 @@ def build_products(reviews: list[dict]) -> list[dict]:
                 "features": top_keywords(text_blob),
                 "image_url": stats["image_url"],
                 "preferred_price_range": price_bucket(price),
+                "metadata_source": REVIEW_TRAIN_METADATA_SOURCE,
+                "metadata_provenance": {
+                    "title": REVIEW_TRAIN_METADATA_SOURCE,
+                    "category": "review_source_category",
+                    "store": "synthetic_catalog",
+                    "price": "synthetic_catalog",
+                    "average_rating": REVIEW_TRAIN_METADATA_SOURCE,
+                    "rating_number": REVIEW_TRAIN_METADATA_SOURCE,
+                    "description": REVIEW_TRAIN_METADATA_SOURCE,
+                    "features": REVIEW_TRAIN_METADATA_SOURCE,
+                    "image_url": REVIEW_TRAIN_METADATA_SOURCE,
+                    "preferred_price_range": "synthetic_catalog",
+                },
             }
         )
     products.sort(key=lambda row: row["product_id"])
@@ -250,7 +393,10 @@ def build_users(interactions: list[dict], products: list[dict]) -> list[dict]:
         grouped[row["user_id"]].append(row)
 
     users = []
-    for user_id, rows in grouped.items():
+    for user_id, all_rows in grouped.items():
+        rows = [row for row in all_rows if row.get("split", "train") == "train"]
+        if not rows:
+            continue
         ratings = [parse_float(row.get("rating"), 0.0) for row in rows]
         positive_rows = [row for row in rows if parse_int(row.get("label"), 0) == 1]
         category_counts = Counter(product_map.get(row["product_id"], {}).get("category", "unknown") for row in positive_rows)
@@ -293,6 +439,8 @@ def build_reviews_table(reviews: list[dict]) -> list[dict]:
             "rating": row.get("rating", 0.0),
             "timestamp": row.get("timestamp", 0),
             "helpful_vote": row.get("helpful_vote", 0),
+            "verified_purchase": row.get("verified_purchase", False),
+            "image_url": row.get("image_url", ""),
             "source_category": row.get("source_category", ""),
         }
         for row in reviews
@@ -355,7 +503,16 @@ def write_processed_dataset_from_reviews(reviews_source: Iterable[dict], output_
     output.mkdir(parents=True, exist_ok=True)
     reviews = list(reviews_source)
     interactions = build_interactions(reviews)
-    products = build_products(reviews)
+    training_review_keys = {
+        (
+            str(row.get("user_id", "")),
+            str(row.get("product_id", "")),
+            parse_int(row.get("timestamp"), 0),
+        )
+        for row in interactions
+        if row.get("split", "train") == "train"
+    }
+    products = build_products(reviews, training_review_keys)
     users = build_users(interactions, products)
     sessions = build_sessions(interactions, products)
     business_context = build_business_context(products)
@@ -398,16 +555,7 @@ def write_processed_dataset_from_reviews(reviews_source: Iterable[dict], output_
     write_csv_rows(
         output / "reviews.csv",
         build_reviews_table(reviews),
-        [
-            "user_id",
-            "product_id",
-            "review_title",
-            "review_text",
-            "rating",
-            "timestamp",
-            "helpful_vote",
-            "source_category",
-        ],
+        REVIEW_FIELDS,
     )
     write_csv_rows(
         output / "sessions.csv",
@@ -419,6 +567,7 @@ def write_processed_dataset_from_reviews(reviews_source: Iterable[dict], output_
         business_context,
         ["product_id", "inventory_score", "margin_score", "discount_rate", "risk_score", "campaign_eligible"],
     )
+    write_dataset_manifest(output)
     return {
         "reviews": len(reviews),
         "reviews_by_category": dict(
@@ -491,15 +640,31 @@ def append_processed_dataset_from_reviews(
         }
 
     interactions = split_interactions([*existing_interactions, *build_interactions(new_reviews)])
-    product_map = {row["product_id"]: row for row in existing_products}
-    for product_row in build_products(new_reviews):
-        # Giữ metadata/ảnh đã enrich nếu ASIN đã tồn tại trong catalog.
-        product_map.setdefault(product_row["product_id"], product_row)
-    products = sorted(product_map.values(), key=lambda row: row["product_id"])
+    training_review_keys = {
+        (
+            str(row.get("user_id", "")),
+            str(row.get("product_id", "")),
+            parse_int(row.get("timestamp"), 0),
+        )
+        for row in interactions
+        if row.get("split", "train") == "train"
+    }
+    reviews_table = [*existing_reviews, *build_reviews_table(new_reviews)]
+    existing_product_map = {row["product_id"]: row for row in existing_products}
+    # Rebuild every review-derived field against the newly computed global
+    # train split.  This matters when appending an older event moves a formerly
+    # training event into validation/test.  Only catalog metadata with explicit
+    # field-level provenance is restored afterward.
+    products = [
+        overlay_verified_amazon_metadata(
+            product_row,
+            existing_product_map.get(product_row["product_id"]),
+        )
+        for product_row in build_products(reviews_table, training_review_keys)
+    ]
     users = build_users(interactions, products)
     sessions = build_sessions(interactions, products)
     business_context = build_business_context(products)
-    reviews_table = [*existing_reviews, *build_reviews_table(new_reviews)]
 
     write_csv_rows(
         interactions_path,
@@ -521,10 +686,7 @@ def append_processed_dataset_from_reviews(
     write_csv_rows(
         reviews_path,
         reviews_table,
-        [
-            "user_id", "product_id", "review_title", "review_text", "rating", "timestamp",
-            "helpful_vote", "source_category",
-        ],
+        REVIEW_FIELDS,
     )
     write_csv_rows(
         output / "sessions.csv",
@@ -539,6 +701,7 @@ def append_processed_dataset_from_reviews(
             "risk_score", "campaign_eligible",
         ],
     )
+    write_dataset_manifest(output)
     return {
         "reviews": len(reviews_table),
         "users": len(users),

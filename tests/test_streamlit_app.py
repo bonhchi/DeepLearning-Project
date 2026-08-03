@@ -1,6 +1,34 @@
 import unittest
 
-from src.app.streamlit_app import display_image_url, next_result_page
+from src.app.streamlit_app import display_image_url, execute_search_option, next_result_page
+
+
+class _FakeSearch:
+    last_trace = {"mode": "lexical", "intent": "unknown"}
+
+    def search(self, query, top_k, mode):
+        self.last_trace = {"query": query, "mode": mode, "intent": "unknown"}
+        return [
+            {
+                "product_id": mode,
+                "title": mode,
+                "final_score": 0.8,
+                "semantic_score": 0.7,
+                "lexical_score": 0.9,
+            }
+        ]
+
+
+class _FakeRouter:
+    def route(self, query, **kwargs):
+        return {
+            "original_query": query,
+            "detected_intent": "product_search",
+            "intent_confidence": 0.9,
+            "rewritten_query": query,
+            "search_mode": kwargs.get("mode"),
+            "results": [{"product_id": "aware", "match_percentage": 90.0}],
+        }
 
 
 class StreamlitAppHelpersTests(unittest.TestCase):
@@ -30,6 +58,18 @@ class StreamlitAppHelpersTests(unittest.TestCase):
 
         self.assertEqual(next_result_page(None, key, 3), 0)
         self.assertEqual(next_result_page(key, key, 0), 1)
+
+    def test_ui_can_compare_all_three_search_modes(self) -> None:
+        rows, trace, comparison = execute_search_option(
+            {"baseline": _FakeSearch(), "router": _FakeRouter()},
+            recommender=None,
+            query="headphones",
+            option="So sánh cả 3 chế độ",
+            top_k=5,
+        )
+        self.assertEqual(rows[0]["product_id"], "aware")
+        self.assertEqual(trace["detected_intent"], "product_search")
+        self.assertEqual(len(comparison), 3)
 
 
 if __name__ == "__main__":

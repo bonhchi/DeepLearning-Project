@@ -1,0 +1,6 @@
+# Optional full NLP/semantic-search stack. The core project and deterministic
+# fallbacks continue to run with requirements.txt only.
+-r requirements.txt
+scikit-learn>=1.4
+sentence-transformers>=3.0
+faiss-cpu>=1.8

@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.io_utils import read_csv_rows, write_csv_rows
-from src.preprocessing.dataset_builder import PRODUCT_FIELDS
+from src.io_utils import json_loads_safe, read_csv_rows, write_csv_rows
+from src.preprocessing.dataset_builder import AMAZON_ITEM_METADATA_SOURCE, PRODUCT_FIELDS
 from src.preprocessing.metadata_enricher import enrich_product_images, infer_metadata_categories
 
 
@@ -58,6 +58,10 @@ class MetadataEnricherTests(unittest.TestCase):
         self.assertEqual(enriched["image_url"], "https://example.com/main.jpg")
         self.assertEqual(enriched["title"], "Real product title")
         self.assertEqual(enriched["price"], "39.99")
+        self.assertEqual(enriched["metadata_source"], AMAZON_ITEM_METADATA_SOURCE)
+        provenance = json_loads_safe(enriched["metadata_provenance"], {})
+        self.assertEqual(provenance["title"], AMAZON_ITEM_METADATA_SOURCE)
+        self.assertEqual(provenance["image_url"], AMAZON_ITEM_METADATA_SOURCE)
 
 
 if __name__ == "__main__":

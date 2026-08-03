@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
 from time import perf_counter
 
-from src.config import ProjectConfig
+from src.config import DEFAULT_INTENT_RANKING_WEIGHTS, ProjectConfig
 from src.feature_extraction.embeddings import product_text, tokenize
 from src.io_utils import (
     json_loads_safe,
@@ -21,6 +22,7 @@ from src.io_utils import (
 from src.models.content_based import build_user_profiles, recommend_content
 from src.models.popularity import recommend_popular, train_popularity
 from src.models.two_tower import TwoTowerModel
+from src.personalization.explanation_builder import ExplanationBuilder
 from src.vector_ops import cosine, sigmoid
 
 
@@ -128,6 +130,47 @@ def _unit_cosine(left: list[float], right: list[float]) -> float:
     return max(0.0, min(1.0, (cosine(left, right) + 1.0) / 2.0))
 
 
+def _preference_text(value: object) -> str:
+    normalized = _ascii_text(str(value)).replace("_", " ")
+    return " ".join(re.findall(r"[a-z0-9]+", normalized))
+
+
+def _profile_values(raw: object) -> list[object]:
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return list(raw)
+    if isinstance(raw, (list, tuple, set)):
+        return list(raw)
+    return [raw]
+
+
+def _structured_preference(raw: object) -> tuple[str, str] | None:
+    text = str(raw or "").strip()
+    if not text or ":" not in text:
+        return None
+    prefix, value = text.split(":", 1)
+    field = {
+        "attribute": "attribute",
+        "feature": "attribute",
+        "brand": "brand",
+        "category": "category",
+        "color": "color",
+        "material": "material",
+        "purpose": "purpose",
+        "review term": "review_term",
+        "review_term": "review_term",
+        "size": "size",
+    }.get(_preference_text(prefix))
+    clean_value = value.strip()
+    return (field, clean_value) if field and clean_value else None
+
+
+def _phrase_in_text(value: object, normalized_product_text: str) -> bool:
+    needle = _preference_text(value)
+    return bool(needle) and f" {needle} " in f" {normalized_product_text} "
+
+
 # Kết hợp model đã train, baseline, catalog và phần giải thích.
 class PersonalizedRecommender:
 
@@ -141,6 +184,7 @@ class PersonalizedRecommender:
         model: TwoTowerModel | None = None,
         modality_embeddings: dict[str, dict[str, list[float]]] | None = None,
         vocabulary: list[str] | None = None,
+        intent_ranking_weights: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.users = {row["user_id"]: row for row in users}
         self.products = {row["product_id"]: row for row in products}
@@ -150,6 +194,18 @@ class PersonalizedRecommender:
         self.model = model
         self.modality_embeddings = modality_embeddings or {}
         self.vocabulary = vocabulary or []
+        self.intent_ranking_weights = {
+            intent: dict(weights)
+            for intent, weights in (
+                intent_ranking_weights or DEFAULT_INTENT_RANKING_WEIGHTS
+            ).items()
+        }
+        for intent, weights in self.intent_ranking_weights.items():
+            if any(float(value) < 0.0 for value in weights.values()):
+                raise ValueError(f"Ranking weights must be non-negative for {intent}")
+            if not math.isclose(sum(float(value) for value in weights.values()), 1.0, abs_tol=1e-6):
+                raise ValueError(f"Ranking weights must sum to 1 for {intent}")
+        self.explanation_builder = ExplanationBuilder()
         self.popularity_scores = train_popularity(interactions)
         self.max_popularity = max(self.popularity_scores.values(), default=1.0)
         # Serving mode không nạp embedding, vì vậy không cần quét interactions lần nữa.
@@ -202,7 +258,264 @@ class PersonalizedRecommender:
             }
         vocabulary = read_json(config.text_vocabulary_path, default=[])
         model = TwoTowerModel.load(config.two_tower_model_path) if config.two_tower_model_path.exists() else None
-        return cls(users, products, interactions, embeddings, model, modality_embeddings, vocabulary)
+        return cls(
+            users,
+            products,
+            interactions,
+            embeddings,
+            model,
+            modality_embeddings,
+            vocabulary,
+            config.intent_ranking_weights,
+        )
+
+    def rank_intent_candidates(
+        self,
+        candidates: list[dict],
+        *,
+        intent: str,
+        user_id: str = "",
+        extracted_entities: dict | None = None,
+        user_profile: dict | None = None,
+        top_k: int = 10,
+    ) -> list[dict]:
+        """Apply configurable, intent-specific ranking without changing retrieval APIs."""
+
+        weights = self.intent_ranking_weights.get(
+            intent,
+            self.intent_ranking_weights["product_search"],
+        )
+        entities = extracted_entities or {}
+        ranked: list[dict] = []
+        for candidate in candidates:
+            product_id = str(candidate.get("product_id", ""))
+            product = dict(self.products.get(product_id, candidate))
+            product.update(candidate)
+            semantic = self._bounded(candidate.get("semantic_score", 0.0))
+            lexical = self._bounded(candidate.get("lexical_score", 0.0))
+            entity_match = self._bounded(
+                candidate.get(
+                    "entity_match_score",
+                    1.0 if candidate.get("matched_entities") else 0.0,
+                )
+            )
+            personalization, profile_evidence = self._profile_preference_evidence(
+                user_id, product_id, product, user_profile or {}
+            )
+            quality = self._bounded(parse_float(product.get("average_rating"), 0.0) / 5.0)
+            popularity = self._bounded(
+                math.log1p(parse_int(product.get("rating_number"), 0)) / 10.0
+            )
+            availability = self._availability_score(product)
+            breakdown = {
+                "semantic_score": semantic,
+                "lexical_score": lexical,
+                "entity_match_score": entity_match,
+                "user_preference_score": personalization,
+                "quality_score": quality,
+                "popularity_score": popularity,
+                "availability_score": availability,
+            }
+            total = sum(weights.get(name, 0.0) * value for name, value in breakdown.items())
+            product["intent"] = intent
+            product["final_score"] = round(total, 6)
+            product["score"] = round(total, 6)
+            product["match_percentage"] = round(total * 100.0, 1)
+            product["score_components"] = breakdown
+            product["profile_evidence"] = profile_evidence
+            product["score_breakdown"] = {
+                name: round(value * 100.0, 1) for name, value in breakdown.items()
+            }
+            matched = candidate.get("matched_entities") or entities
+            product["matched_entities"] = matched
+            product["explanation"] = self.explanation_builder.build(
+                product=product,
+                intent=intent,
+                score_breakdown=breakdown,
+                matched_entities=matched if isinstance(matched, dict) else entities,
+                user_profile=user_profile,
+            )
+            ranked.append(product)
+        ranked.sort(key=lambda row: (-float(row["final_score"]), str(row.get("product_id", ""))))
+        return ranked[: max(top_k, 0)]
+
+    @staticmethod
+    def _bounded(value: object) -> float:
+        return max(0.0, min(parse_float(value, 0.0), 1.0))
+
+    def _profile_preference_score(
+        self,
+        user_id: str,
+        product_id: str,
+        product: dict,
+        profile: dict,
+    ) -> float:
+        score, _ = self._profile_preference_evidence(
+            user_id, product_id, product, profile
+        )
+        return score
+
+    def _profile_preference_evidence(
+        self,
+        user_id: str,
+        product_id: str,
+        product: dict,
+        profile: dict,
+    ) -> tuple[float, dict]:
+        """Score positive profile evidence and penalize evidenced dislikes.
+
+        Negative preferences never lower a candidate merely because a profile
+        contains them: the value must be found in the product's catalog fields.
+        The returned evidence is attached to every ranked row for auditability.
+        """
+
+        evidence: dict[str, object] = {
+            "positive_matches": [],
+            "negative_matches": [],
+            "negative_penalty": 0.0,
+        }
+        if not profile:
+            return self._personalization_score(user_id, product_id), evidence
+
+        normalized_product_text = _preference_text(product_text(product))
+        product_category = _preference_text(product.get("category", ""))
+        product_brand = _preference_text(
+            product.get("brand") or product.get("store") or ""
+        )
+
+        positive_by_field: dict[str, set[str]] = defaultdict(set)
+        for key in ("preferred_categories", "categories"):
+            positive_by_field["category"].update(
+                _preference_text(value)
+                for value in _profile_values(profile.get(key))
+                if _preference_text(value)
+            )
+        for key in ("brands", "preferred_brands"):
+            positive_by_field["brand"].update(
+                _preference_text(value)
+                for value in _profile_values(profile.get(key))
+                if _preference_text(value)
+            )
+        for key in ("attributes", "preferred_features", "features"):
+            positive_by_field["attribute"].update(
+                _preference_text(value)
+                for value in _profile_values(profile.get(key))
+                if _preference_text(value)
+            )
+        for raw in _profile_values(profile.get("positive_preferences")):
+            parsed = _structured_preference(raw)
+            if parsed is not None:
+                field, value = parsed
+                positive_by_field[field].add(_preference_text(value))
+
+        positive_signals: list[float] = []
+        positive_matches: list[dict[str, str]] = []
+        for field, values in positive_by_field.items():
+            if not values:
+                continue
+            matches = [
+                value
+                for value in sorted(values)
+                if self._profile_value_matches_product(
+                    field,
+                    value,
+                    product,
+                    product_category,
+                    product_brand,
+                    normalized_product_text,
+                )
+            ]
+            positive_signals.append(1.0 if matches else 0.0)
+            positive_matches.extend(
+                {"field": field, "value": value} for value in matches
+            )
+
+        price_range = profile.get("preferred_price_range") or profile.get("price_range") or {}
+        price = parse_float(product.get("price"), 0.0)
+        if price and isinstance(price_range, dict) and price_range:
+            minimum = parse_float(
+                price_range.get("min_price", price_range.get("min")), 0.0
+            )
+            maximum_raw = price_range.get("max_price", price_range.get("max"))
+            maximum = (
+                parse_float(maximum_raw, float("inf"))
+                if maximum_raw not in (None, "")
+                else float("inf")
+            )
+            price_matches = minimum <= price <= maximum
+            positive_signals.append(1.0 if price_matches else 0.0)
+            if price_matches:
+                positive_matches.append(
+                    {"field": "price_range", "value": str(price)}
+                )
+
+        base_score = (
+            sum(positive_signals) / len(positive_signals)
+            if positive_signals
+            else self._personalization_score(user_id, product_id)
+        )
+
+        negative_matches: list[dict[str, str]] = []
+        seen_negative: set[tuple[str, str]] = set()
+        for raw in _profile_values(profile.get("negative_preferences")):
+            parsed = _structured_preference(raw)
+            if parsed is None:
+                # Unstructured sentiment is not reliable catalog evidence.
+                continue
+            field, raw_value = parsed
+            value = _preference_text(raw_value)
+            marker = (field, value)
+            if not value or marker in seen_negative:
+                continue
+            seen_negative.add(marker)
+            if self._profile_value_matches_product(
+                field,
+                value,
+                product,
+                product_category,
+                product_brand,
+                normalized_product_text,
+            ):
+                negative_matches.append({"field": field, "value": value})
+
+        # A single evidenced dislike is material, while the cap keeps the score
+        # in [0, 1] even when a profile repeats related negative signals.
+        negative_penalty = min(0.40 * len(negative_matches), 1.0)
+        final_score = self._bounded(base_score - negative_penalty)
+        evidence["positive_matches"] = positive_matches
+        evidence["negative_matches"] = negative_matches
+        evidence["negative_penalty"] = round(negative_penalty, 6)
+        evidence["base_score"] = round(self._bounded(base_score), 6)
+        return final_score, evidence
+
+    @staticmethod
+    def _profile_value_matches_product(
+        field: str,
+        value: str,
+        product: dict,
+        product_category: str,
+        product_brand: str,
+        normalized_product_text: str,
+    ) -> bool:
+        if field == "category":
+            return value == product_category
+        if field == "brand":
+            return value == product_brand
+        if field in {"color", "material", "size"}:
+            explicit = _preference_text(product.get(field, ""))
+            return value == explicit or _phrase_in_text(value, normalized_product_text)
+        if field in {"attribute", "purpose", "review_term"}:
+            return _phrase_in_text(value, normalized_product_text)
+        return False
+
+    @staticmethod
+    def _availability_score(product: dict) -> float:
+        raw = product.get("in_stock", product.get("available", product.get("availability")))
+        if raw is None or str(raw).strip() == "":
+            return 0.5
+        return 1.0 if str(raw).strip().casefold() in {
+            "1", "true", "yes", "in stock", "available", "con hang", "còn hàng"
+        } else 0.0
 
     # Lập chỉ mục category để giới hạn số item phải chấm điểm cho một nhu cầu rõ ràng.
     def _index_products_by_category(self, products: list[dict]) -> dict[str, list[str]]:

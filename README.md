@@ -2,6 +2,119 @@
 
 MVP xử lý [Amazon Reviews 2023](https://amazon-reviews-2023.github.io/), tạo dữ liệu cho user/product/session/business context, tạo embedding text/image/metadata, chạy baseline popularity/content-based, train two-tower nhẹ, đánh giá Top-K và mở demo Streamlit.
 
+Project hiện cũng có một pipeline NLP độc lập cho đề tài **Intent-Aware Semantic
+Search for Personalized Product Discovery**. Pipeline mới tái sử dụng catalog và
+interactions cũ, đồng thời bổ sung intent detection, entity extraction, query
+rewriting, dense/lexical retrieval, intent router, personalized ranking, audit và
+retrieval evaluation. Các lệnh cũ vẫn được giữ nguyên.
+
+## NLP semantic-search MVP
+
+Sáu intent được hỗ trợ:
+
+| Intent | Chiến lược |
+| --- | --- |
+| `product_search` | Hybrid retrieval và metadata filter |
+| `need_based_search` | Query expansion/rewrite rồi semantic retrieval |
+| `similar_product_search` | Item-to-item similarity |
+| `personalized_recommendation` | Tăng trọng số user profile |
+| `availability_check` | Filter theo stock thật nếu có; hiện demo dùng inventory proxy |
+| `comparison` | Trả một nhóm sản phẩm ngắn để so sánh |
+
+Entity extractor hỗ trợ tiếng Việt và tiếng Anh với các trường `category`, `brand`,
+`color`, `size`, `material`, `feature`, `purpose`, `min_price` và `max_price`. Ranking
+theo intent kết hợp semantic, lexical, entity match, user preference, quality,
+popularity và availability; trọng số nằm trong `ProjectConfig`.
+
+`business_context.csv` hiện sinh `inventory_score` xác định từ hash để demo ranking;
+đây **không phải tồn kho Amazon thời gian thực**. UI, audit và qrels ghi rõ nguồn
+`business_context_inventory_proxy`. Muốn dùng production phải ingest stock thật và
+thay `availability_source`. Giá catalog hiện là USD; truy vấn VND dùng tỷ giá cấu hình
+trong `ProjectConfig.currency_rates_to_catalog`, không phải tỷ giá live.
+
+### Chạy workflow NLP trên Windows CMD
+
+```cmd
+cd /d D:\Backup\Code\DeepLearning
+.venv\Scripts\python.exe main.py prepare --source huggingface --limit-per-category 1000
+.venv\Scripts\python.exe main.py prepare-queries --category Electronics --max-products 500
+.venv\Scripts\python.exe main.py train-intent
+.venv\Scripts\python.exe main.py evaluate-intent
+.venv\Scripts\python.exe main.py index-semantic --category Electronics --max-products 10000
+.venv\Scripts\python.exe main.py pool-qrels --top-k 10 --qrels-per-query 50
+.venv\Scripts\python.exe main.py audit-search --query "tai nghe chống ồn dưới $100" --top-k 5
+```
+
+Catalog cũ chưa có `data/processed/dataset_manifest.json` phải chạy lại `prepare`
+trước khi index chính thức. Manifest xác nhận split theo timeline và product/user
+feature chỉ dùng train. `--allow-legacy-catalog` chỉ dành cho smoke test, không được
+chấp nhận ở benchmark chính thức.
+
+`prepare-queries` tạo:
+
+- `data/queries/intent_queries.csv`: dataset sáu intent với split train/validation/test.
+- `data/queries/qrels.csv`: relevance candidate tự động.
+- `data/queries/qrels_review.csv`: hàng validation/test cần review thủ công.
+
+Sau khi có index, `pool-qrels` lấy hợp của đúng bốn cấu hình sẽ được benchmark ở
+độ sâu đã chọn. `qrels-per-query` phải đủ chứa `4 × top-k + 1`. Các judgment đã có
+`reviewed=true` được giữ lại khi chạy lại `prepare-queries` hoặc `pool-qrels` nếu
+cặp query–product vẫn còn.
+
+Benchmark chính thức mặc định chỉ dùng qrels validation/test đã có
+`reviewed=true`, nhằm tránh coi nhãn sinh tự động là ground truth. Sau khi review:
+
+Mở `data/queries/qrels_review.csv`, kiểm tra từng cặp query–product, sửa
+`relevance` về `0`, `1` hoặc `2` và đổi `reviewed` thành `true`. Evaluation tự động
+overlay những hàng đã duyệt lên qrels bootstrap; không cần sửa `qrels.csv`.
+Một query chỉ được đưa vào benchmark chính thức khi **toàn bộ** candidate của query
+đã được duyệt. Với personalized query, cột `profile_context` cung cấp tín hiệu train
+của đúng user để annotator đánh giá.
+
+```cmd
+.venv\Scripts\python.exe main.py evaluate-search --top-k 5
+.venv\Scripts\python.exe main.py ablation --top-k 5
+```
+
+Chỉ để smoke-test pipeline trước khi annotation, có thể dùng
+`--allow-unreviewed-qrels`. Báo cáo so sánh bốn cấu hình TF-IDF, dense semantic,
+semantic + intent và semantic + intent + personalization được lưu trong
+`outputs/reports/search_metrics.json`.
+`top-k` lúc evaluate không được lớn hơn độ sâu đã ghi trong
+`qrels_pool_manifest.json`. Uplift personalization được tính riêng trên query của
+đúng user, với profile từ train và target từ temporal holdout; query không chứa tên
+sản phẩm target.
+
+### Backend semantic đầy đủ và fallback offline
+
+Không cài thêm dependency, `IntentClassifier`, `DenseTextEncoder` và `VectorIndex`
+vẫn chạy bằng fallback Python thuần để test và phát triển offline. Dense fallback là
+feature hashing deterministic, **không phải Sentence Transformer thật**; vector index
+fallback dùng exact cosine thay vì FAISS.
+Lexical index được lưu dưới dạng sparse inverted index, không tạo ma trận đặc
+`số sản phẩm × vocabulary` trong RAM.
+
+Để chạy đúng stack dense semantic + FAISS của đề tài:
+
+```cmd
+.venv\Scripts\python.exe -m pip install -r requirements-nlp.txt
+.venv\Scripts\python.exe main.py index-semantic --category Electronics --max-products 10000 --dense-backend sentence-transformers --allow-model-download
+```
+
+`index-semantic` là tác vụ dài và tạo artifact mới. Có thể đặt `--max-products 0`
+để index toàn bộ domain đã chọn khi máy đủ RAM và đã cài FAISS; exact fallback lớn
+bị chặn an toàn. Backend và verification vector của model được khóa trong artifact.
+Manifest checksum buộc rebuild nếu catalog, encoder hoặc index thay đổi giữa chừng.
+
+Streamlit tự phát hiện NLP artifacts và cho phép chọn hoặc so sánh trên cùng truy vấn:
+
+- Keyword Search (TF-IDF).
+- Dense Semantic Search.
+- Intent-Aware Personalized Search.
+
+Nếu artifacts chưa có hoặc không đồng bộ với catalog, app vẫn chạy recommender cũ và
+hiển thị hướng dẫn tạo lại index.
+
 Pipeline hỗ trợ hai nguồn mà không thay đổi các bước train/evaluate phía sau:
 
 - `local`: file `dataset/Amazon_Fashion.jsonl` đã có từ trước.
@@ -12,10 +125,14 @@ Bốn category mặc định là `Automotive`, `Electronics`, `Health_and_Househ
 ## Cấu trúc
 
 ```text
-data/processed/          users/products/interactions/reviews/sessions/business_context
+data/processed/          tables + leakage/provenance dataset_manifest.json
 data/embeddings/         product text/image/metadata/fused embeddings
+data/queries/            intent query dataset, qrels và annotation queue
 outputs/models/          two_tower_model.json
-outputs/reports/         metrics.json
+outputs/indexes/         sparse lexical, semantic index và checksum manifest
+outputs/reports/         recommendation, intent, search và ablation metrics
+src/nlp/                 intent taxonomy/classifier, entity extraction, query rewriting
+src/semantic_search/     encoder-facing hybrid retrieval và vector index
 src/                     source code chính
 main.py                  CLI workflow
 ```
@@ -160,13 +277,27 @@ và bỏ qua review trùng theo user, sản phẩm và timestamp.
 
 Pipeline mở từng JSONL qua HTTPS streaming bằng Python standard library và dừng ngay khi đủ giới hạn của category. Cách này không import `datasets`, Pandas hay NumPy nên tránh lỗi DLL native trên Windows. Dữ liệu chuẩn hóa được ghi vào `data/processed`; code train, evaluate, Streamlit và bất kỳ model local nào đọc CSV này không phụ thuộc Hugging Face hay LM Studio sau bước prepare.
 
-## Chạy toàn bộ bằng dữ liệu local cũ
+## Chạy toàn bộ pipeline NLP
 
 ```bash
-python3 main.py all --limit 5000 --top-k 10 --epochs 3
+python3 main.py all --limit 5000 --query-products 300 --index-products 5000 --top-k 5 --epochs 3
 ```
 
-Lệnh này tiếp tục đọc `dataset/Amazon_Fashion.jsonl`, tạo dữ liệu xử lý, train model, đánh giá và in thử recommendation cho một user. Đây là hành vi tương thích ngược mặc định.
+`all` chạy theo thứ tự `prepare → prepare-queries → train-intent → index-semantic
+→ pool-qrels → train → evaluate-intent`. Mặc định lệnh dừng tại trạng thái
+`awaiting_qrels_review`; sau khi duyệt toàn bộ `qrels_review.csv`, chạy:
+
+```bash
+python3 main.py evaluate-search --top-k 5
+python3 main.py ablation --top-k 5
+```
+
+Đây là workflow dài và ghi lại processed data, embedding, model, index và report.
+Với nguồn local Fashion, để trống `--nlp-category` sẽ tự chọn category lớn nhất vừa
+prepare. Thêm `--allow-unreviewed-qrels` chỉ khi cần smoke-test; khi đó `all` mới chạy
+tiếp `evaluate-search → ablation`, và kết quả không được dùng làm benchmark chính thức.
+
+Các lệnh cũ `prepare`, `train`, `evaluate`, `recommend` và `audit` vẫn hoạt động độc lập.
 
 ## Chạy từng bước
 
@@ -248,6 +379,11 @@ Lệnh đọc metadata theo streaming, ưu tiên ảnh biến thể `MAIN` có �
 ## Ghi chú dữ liệu
 
 Lệnh `prepare` mặc định đọc phần review thô. Với Hugging Face, `category` lấy trực tiếp từ tên domain; với file Fashion local, category con vẫn được suy luận bằng keyword. Trước khi chạy `enrich-images`, store/price/business context được sinh ổn định theo `product_id` và ảnh lấy từ review nếu có. Sau enrichment, title/store/price/ảnh được thay bằng item metadata thật khi nguồn cung cấp bản ghi tương ứng.
+
+Split interaction dùng cutoff thời gian theo từng user: mọi event sau validation/test
+cutoff đều không được quay lại train. Text/rating/feature lấy từ review chỉ aggregate
+trên train; metadata Amazon độc lập được giữ qua field-level provenance khi append.
+Nếu append làm split thay đổi, catalog behavioral fields được rebuild lại toàn bộ.
 
 LM Studio không bắt buộc cho pipeline hiện tại. Nếu dùng model/embedding từ LM Studio sau này, nên giữ bước ingest này độc lập và đọc các CSV đã chuẩn hóa trong `data/processed` qua endpoint OpenAI-compatible của LM Studio.
 

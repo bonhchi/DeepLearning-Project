@@ -7,7 +7,12 @@ from pathlib import Path
 
 from src.data.amazon_reviews import METADATA_CATEGORIES, iter_huggingface_product_metadata
 from src.io_utils import parse_float, parse_int, read_csv_rows, write_csv_rows
-from src.preprocessing.dataset_builder import PRODUCT_FIELDS, price_bucket
+from src.preprocessing.dataset_builder import (
+    AMAZON_ITEM_METADATA_SOURCE,
+    PRODUCT_FIELDS,
+    parse_metadata_provenance,
+    price_bucket,
+)
 
 
 def infer_metadata_categories(products: list[dict]) -> list[str]:
@@ -29,27 +34,41 @@ def infer_metadata_categories(products: list[dict]) -> list[str]:
 def apply_product_metadata(product: dict, metadata: dict) -> bool:
     """Cập nhật một product và trả về True nếu thêm được URL ảnh catalog."""
     had_image = bool(str(product.get("image_url", "")).strip())
+    updated_fields: list[str] = []
     image_url = str(metadata.get("image_url", "")).strip()
     if image_url:
         product["image_url"] = image_url
+        updated_fields.append("image_url")
     if metadata.get("title"):
         product["title"] = metadata["title"]
+        updated_fields.append("title")
     if metadata.get("store"):
         product["store"] = metadata["store"]
+        updated_fields.append("store")
     if metadata.get("description"):
         product["description"] = metadata["description"]
+        updated_fields.append("description")
     if metadata.get("features"):
         product["features"] = metadata["features"]
+        updated_fields.append("features")
     price = parse_float(metadata.get("price"), 0.0)
     if price > 0:
         product["price"] = price
         product["preferred_price_range"] = price_bucket(price)
+        updated_fields.extend(["price", "preferred_price_range"])
     average_rating = parse_float(metadata.get("average_rating"), 0.0)
     if average_rating > 0:
         product["average_rating"] = average_rating
+        updated_fields.append("average_rating")
     rating_number = parse_int(metadata.get("rating_number"), 0)
     if rating_number > 0:
         product["rating_number"] = rating_number
+        updated_fields.append("rating_number")
+    if updated_fields:
+        provenance = parse_metadata_provenance(product)
+        provenance.update({field: AMAZON_ITEM_METADATA_SOURCE for field in updated_fields})
+        product["metadata_source"] = AMAZON_ITEM_METADATA_SOURCE
+        product["metadata_provenance"] = provenance
     return not had_image and bool(image_url)
 
 
